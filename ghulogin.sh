@@ -145,14 +145,16 @@ rsa_encrypt_password() {
 # 认证核心
 #================================================================
 do_login() {
+    local force="${1:-}"
+
     # 检查配置
     if [ -z "${USERNAME:-}" ] || [ -z "${PASSWORD:-}" ]; then
         print_error "未配置用户名或密码，请先运行 qhulogin config"
         return 1
     fi
 
-    # 检测网络
-    if check_online; then
+    # 检测网络（强制模式跳过）
+    if [ "$force" != "force" ] && check_online; then
         print_success "已在线，无需认证"
         return 0
     fi
@@ -629,29 +631,31 @@ show_menu() {
 
         echo ""
         echo -e "  ${CYAN}1${NC}) 立即登录"
-        echo -e "  ${CYAN}2${NC}) 查看状态"
-        echo -e "  ${CYAN}3${NC}) 查看日志"
-        echo -e "  ${CYAN}4${NC}) 配置账号"
-        echo -e "  ${CYAN}5${NC}) 启动保活"
-        echo -e "  ${CYAN}6${NC}) 停止保活"
-        echo -e "  ${CYAN}7${NC}) 安装到系统"
-        echo -e "  ${CYAN}8${NC}) 卸载"
-        echo -e "  ${CYAN}9${NC}) 检查更新"
+        echo -e "  ${CYAN}2${NC}) 强制重新登录"
+        echo -e "  ${CYAN}3${NC}) 查看状态"
+        echo -e "  ${CYAN}4${NC}) 查看日志"
+        echo -e "  ${CYAN}5${NC}) 配置账号"
+        echo -e "  ${CYAN}6${NC}) 启动保活"
+        echo -e "  ${CYAN}7${NC}) 停止保活"
+        echo -e "  ${CYAN}8${NC}) 安装到系统"
+        echo -e "  ${CYAN}9${NC}) 卸载"
+        echo -e "  ${CYAN}u${NC}) 检查更新"
         echo -e "  ${CYAN}0${NC}) 退出"
         echo ""
-        printf "  请选择 [0-9]: "
+        printf "  请选择: "
         read -r choice
 
         case "$choice" in
             1) do_login ;;
-            2) do_status ;;
-            3) do_logs ;;
-            4) do_config ;;
-            5) do_service_ctrl start ;;
-            6) do_service_ctrl stop ;;
-            7) do_install ;;
-            8) do_uninstall ;;
-            9) do_update ;;
+            2) do_login force ;;
+            3) do_status ;;
+            4) do_logs ;;
+            5) do_config ;;
+            6) do_service_ctrl start ;;
+            7) do_service_ctrl stop ;;
+            8) do_install ;;
+            9) do_uninstall ;;
+            u) do_update ;;
             0) echo -e "${GRAY}再见!${NC}"; exit 0 ;;
             *) print_error "无效选择" ;;
         esac
@@ -670,6 +674,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}命令:${NC}"
     echo -e "  ${CYAN}login${NC}       立即认证"
+    echo -e "  ${CYAN}relogin${NC}     强制重新认证(即使已在线)"
     echo -e "  ${CYAN}status${NC}      查看状态"
     echo -e "  ${CYAN}logs${NC}        查看日志"
     echo -e "  ${CYAN}config${NC}      交互式配置"
@@ -695,6 +700,7 @@ main() {
 
     case "$cmd" in
         login)      do_login ;;
+        relogin)    do_login force ;;
         status)     do_status ;;
         logs)       do_logs ;;
         config)     do_config ;;
