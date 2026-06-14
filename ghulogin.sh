@@ -279,18 +279,13 @@ do_keepalive() {
     while true; do
         sleep "$interval"
 
-        # Ping检测
-        if ping -c 3 -W 5 "${PING_HOST:-180.101.50.188}" >/dev/null 2>&1; then
-            continue
-        fi
-
-        # Ping失败，检查是否真的离线
+        # 用HTTP检测认证状态（Ping不经过ePortal，无法检测认证掉线）
         if check_online; then
             continue
         fi
 
-        print_warn "网络断开，尝试重新认证..."
-        log_msg "KEEPALIVE" "检测到断网，重新认证"
+        print_warn "认证掉线或网络断开，尝试重新认证..."
+        log_msg "KEEPALIVE" "检测到掉线，重新认证"
 
         # 重新认证，无限重试
         local reconnect=0
