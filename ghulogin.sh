@@ -578,16 +578,26 @@ do_update() {
         return 1
     fi
 
-    # 对比版本
-    local current_ver
+    # 对比文件内容（版本号+文件哈希双重检测）
+    local current_ver new_ver
     current_ver=$(grep '^# Version:' "$0" 2>/dev/null | head -1 | awk '{print $3}')
-    local new_ver
     new_ver=$(grep '^# Version:' "$tmp_file" 2>/dev/null | head -1 | awk '{print $3}')
 
-    if [ -n "$current_ver" ] && [ -n "$new_ver" ] && [ "$current_ver" = "$new_ver" ]; then
+    # 计算文件MD5
+    local current_md5 new_md5
+    current_md5=$(md5sum "$0" 2>/dev/null | awk '{print $1}')
+    new_md5=$(md5sum "$tmp_file" 2>/dev/null | awk '{print $1}')
+
+    if [ "$current_md5" = "$new_md5" ]; then
         print_info "当前已是最新版本 ($current_ver)"
         rm -f "$tmp_file"
         return 0
+    fi
+
+    if [ -n "$new_ver" ]; then
+        print_info "发现新版本: ${current_ver:-未知} → $new_ver"
+    else
+        print_info "发现文件变更，准备更新"
     fi
 
     # 停止服务
