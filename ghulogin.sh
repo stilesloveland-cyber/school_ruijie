@@ -1,14 +1,14 @@
 #!/bin/sh
 #================================================================
 # qhulogin - 锐捷ePortal自动认证工具
-# Version: 1.0.0
+# Version: 1.1.0
 # 功能：校园网自动登录 + 保活重连 + 命令行管理
 # 平台：iStoreOS/OpenWrt (斐讯N1)
 # 用法：qhulogin [命令]
 #================================================================
 
-# 严格模式
-set -uo pipefail
+# 严格模式 (busybox ash 不支持 pipefail)
+set -u
 
 #================================================================
 # 颜色定义
@@ -48,6 +48,15 @@ log_msg() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] [$level] $msg" >> "$LOG_FILE" 2>/dev/null
+
+    # 日志轮转：超过100KB截断保留最后200行
+    local log_size
+    log_size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$log_size" -gt 102400 ] 2>/dev/null; then
+        local tmp_log="/tmp/qhulogin_log_tmp"
+        tail -200 "$LOG_FILE" > "$tmp_log" 2>/dev/null
+        mv "$tmp_log" "$LOG_FILE" 2>/dev/null
+    fi
 }
 
 print_info()    { echo -e "${CYAN}[INFO]${NC} $*"; log_msg "INFO" "$*"; }
@@ -107,12 +116,17 @@ get_service_name() {
 #================================================================
 check_online() {
     local code
-    code=$(curl -s -I -m 10 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
+    # 主检测点
+    code=$(curl -s -I -m 5 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
     if [ "$code" = "204" ]; then
         return 0
-    else
-        return 1
     fi
+    # 备选检测点
+    code=$(curl -s -I -m 5 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
+    if [ "$code" = "204" ]; then
+        return 0
+    fi
+    return 1
 }
 
 #================================================================
@@ -147,25 +161,33 @@ rsa_encrypt_password() {
 do_login() {
     local force="${1:-}"
 
+    # 加载配置
+    load_config 2>/dev/null
+
     # 检查配置
     if [ -z "${USERNAME:-}" ] || [ -z "${PASSWORD:-}" ]; then
         print_error "未配置用户名或密码，请先运行 qhulogin config"
         return 1
     fi
 
-    # 检测网络（强制模式跳过）
+    # 检测网络（强制模式跳过在线检测，但仍需获取认证页）
     if [ "$force" != "force" ] && check_online; then
         print_success "已在线，无需认证"
         return 0
     fi
 
-    print_info "检测到需要认证，开始登录..."
+    print_info "开始登录..."
 
-    # 获取302重定向URL (ePortal返回HTML包含JS跳转或meta刷新)
+    # 获取认证页面
     local response
     response=$(curl -s -L -m 10 "http://www.google.cn/generate_204" 2>/dev/null)
+
+    # 强制模式且已在线时，response可能为空(204无内容)
     if [ -z "$response" ]; then
-        # 如果完全无响应，可能是物理网络不通
+        if check_online; then
+            print_success "已在线，无需重新认证"
+            return 0
+        fi
         print_error "网络不通，无法访问认证服务器"
         log_msg "LOGIN" "网络不通，curl无响应"
         return 1
@@ -278,7 +300,7 @@ do_keepalive() {
 
     print_info "qhulogin 保活模式启动"
     print_info "用户: ${USERNAME}  运营商: $(get_service_name "${SERVICE:-campus}")"
-    print_info "Ping目标: ${PING_HOST:-180.101.50.188}  间隔: ${PING_INTERVAL:-30}s"
+    print_info "检测间隔: ${PING_INTERVAL:-30}s"
 
     # 写入PID
     echo $$ > "$PID_FILE"
@@ -429,25 +451,14 @@ do_config() {
         *) SERVICE="${SERVICE:-campus}" ;;
     esac
 
-    # Ping目标
-    printf "  Ping目标 [${PING_HOST:-180.101.50.188}]: "
-    read -r input
-    PING_HOST="${input:-${PING_HOST:-180.101.50.188}}"
-
-    # Ping间隔
-    printf "  Ping间隔(秒) [${PING_INTERVAL:-30}]: "
-    read -r input
-    PING_INTERVAL="${input:-${PING_INTERVAL:-30}}"
-
     echo ""
     save_config
 
     echo -e ""
     print_info "配置摘要:"
     echo -e "  用户名: ${USERNAME}"
-    echo -e "  密码:   ${PASSWORD}"
+    echo -e "  密码:   ****"
     echo -e "  运营商: $(get_service_name "$SERVICE")"
-    echo -e "  Ping:   ${PING_HOST} / ${PING_INTERVAL}s"
 }
 
 #================================================================
@@ -527,26 +538,36 @@ do_uninstall() {
 #================================================================
 do_update() {
     local repo="https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/master/ghulogin.sh"
+    local mirror="https://ghfast.top/https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/master/ghulogin.sh"
     local tmp_file="/tmp/qhulogin_update.sh"
 
     print_info "正在检查更新..."
 
-    # 下载最新版本
-    if ! curl -sS -L -o "$tmp_file" "$repo" 2>/dev/null; then
-        print_error "下载失败，请检查网络连接"
+    # 下载最新版本（先尝试直连，失败后用镜像）
+    local http_code
+    http_code=$(curl -L -s --connect-timeout 10 -o "$tmp_file" -w '%{http_code}' "$repo" 2>/dev/null)
+    if [ "$http_code" != "200" ]; then
+        print_warn "直连 GitHub 失败 (HTTP ${http_code:-无响应})，尝试镜像源..."
+        http_code=$(curl -L -s --connect-timeout 10 -o "$tmp_file" -w '%{http_code}' "$mirror" 2>/dev/null)
+    fi
+
+    if [ "$http_code" != "200" ]; then
+        print_error "下载失败 (HTTP ${http_code:-无响应})，请检查网络"
+        rm -f "$tmp_file"
         return 1
     fi
 
     # 检查下载是否有效
     if [ ! -s "$tmp_file" ]; then
-        print_error "下载文件为空"
+        print_error "下载文件为空，可能网络不通或仓库地址有误"
         rm -f "$tmp_file"
         return 1
     fi
 
-    # 检查是否为有效脚本
-    if ! head -1 "$tmp_file" | grep -q "^#!/bin/sh"; then
-        print_error "下载文件无效"
+    # 检查是否为有效脚本 (兼容不同换行符)
+    if ! head -1 "$tmp_file" | grep -q '#!/bin/sh'; then
+        print_error "下载内容非有效脚本（可能返回了错误页面）"
+        log_msg "UPDATE" "文件开头: $(head -1 "$tmp_file" | head -c 100)"
         rm -f "$tmp_file"
         return 1
     fi
