@@ -184,7 +184,7 @@ do_login() {
     response=$(curl -s -L -m 10 "http://www.google.cn/generate_204" 2>/dev/null)
 
     # 提取登录页URL
-    local login_page_url
+    local login_page_url=""
     if [ -n "$response" ]; then
         # 尝试从href='xxx'提取
         login_page_url=$(echo "$response" | grep -oE "href='[^']+'" | head -1 | sed "s/href='//;s/'//")
