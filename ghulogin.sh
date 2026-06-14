@@ -165,13 +165,35 @@ get_active_ifaces() {
         fi
     fi
 
-    # auto模式：枚举所有活跃网卡
-    for iface in $(ip link show up 2>/dev/null | grep -oE '^[0-9]+: [^:@]+' | awk '{print $2}' | grep -v '^lo$'); do
-        # 确认已分配IPv4地址
-        if ip addr show "$iface" 2>/dev/null | grep -q 'inet '; then
-            iface_list="${iface_list}${iface_list:+ }${iface}"
+    # auto模式：只枚举有默认路由的网卡（能出外网的才需要认证）
+    for iface in $(ip route show 2>/dev/null | grep '^default' | awk '{print $5}' | sort -u); do
+        # 排除纯虚拟接口（docker、veth、lxc等），但保留 br-lan 这类桥接接口
+        case "$iface" in
+            lo|docker*|veth*|virbr*|lxc*|tun*|tap*) continue ;;
+        esac
+        # 确认网卡UP且已分配IPv4地址
+        if ip link show "$iface" 2>/dev/null | grep -q 'state UP'; then
+            if ip addr show "$iface" 2>/dev/null | grep -q 'inet '; then
+                iface_list="${iface_list}${iface_list:+ }${iface}"
+            fi
         fi
     done
+
+    # 如果没有找到有默认路由的网卡，回退到枚举所有活跃非虚拟网卡
+    if [ -z "$iface_list" ]; then
+        for iface in $(ip link show up 2>/dev/null | grep -oE '^[0-9]+: [^:@]+' | awk '{print $2}'); do
+            case "$iface" in
+                lo|docker*|veth*|virbr*|lxc*|tun*|tap*) continue ;;
+            esac
+            # 跳过桥接从属接口（如 wlan0 是 br-lan 的 slave），由桥接主接口统一认证
+            if ip link show "$iface" 2>/dev/null | grep -q 'master'; then
+                continue
+            fi
+            if ip addr show "$iface" 2>/dev/null | grep -q 'inet '; then
+                iface_list="${iface_list}${iface_list:+ }${iface}"
+            fi
+        done
+    fi
 
     echo "$iface_list"
 }
@@ -920,13 +942,7 @@ do_update() {
         print_info "发现文件变更，准备更新"
     fi
 
-    # 停止服务
-    if [ -x "$INIT_SCRIPT" ]; then
-        print_info "停止服务..."
-        "$INIT_SCRIPT" stop 2>/dev/null
-    fi
-
-    # 替换脚本（先备份，验证后删除备份）
+    # 先替换脚本，再停服务（避免killall杀掉自己）
     local target
     if [ -x /usr/bin/qhulogin ]; then
         target="/usr/bin/qhulogin"
@@ -957,10 +973,26 @@ do_update() {
         print_success "更新完成"
     fi
 
-    # 重启服务
+    # 停止保活进程（排除自身PID，避免自杀）
+    local my_pid=$$
+    if [ -f "$PID_FILE" ]; then
+        local keepalive_pid
+        keepalive_pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$keepalive_pid" ] && [ "$keepalive_pid" != "$my_pid" ]; then
+            kill "$keepalive_pid" 2>/dev/null
+        fi
+    fi
+    # 杀掉其他qhulogin进程（排除自身）
+    for pid in $(pidof qhulogin 2>/dev/null); do
+        if [ "$pid" != "$my_pid" ]; then
+            kill "$pid" 2>/dev/null
+        fi
+    done
+
+    # 重启服务（后台延迟执行，避免影响当前进程）
     if [ -x "$INIT_SCRIPT" ]; then
-        print_info "重启服务..."
-        "$INIT_SCRIPT" start 2>/dev/null
+        print_info "将在1秒后重启服务..."
+        (sleep 1; "$INIT_SCRIPT" start) &
     fi
 }
 
