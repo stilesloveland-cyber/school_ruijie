@@ -1,7 +1,7 @@
 #!/bin/sh
 #================================================================
 # qhulogin - 锐捷ePortal自动认证工具
-# Version: 1.1.1
+# Version: 1.3.0
 # 功能：校园网自动登录 + 保活重连 + 命令行管理
 # 平台：iStoreOS/OpenWrt (斐讯N1)
 # 用法：qhulogin [命令]
@@ -85,7 +85,7 @@ save_config() {
 USERNAME="${USERNAME}"
 PASSWORD="${PASSWORD}"
 SERVICE="${SERVICE}"
-PING_HOST="${PING_HOST:-180.101.50.188}"
+IFACE="${IFACE:-auto}"
 PING_INTERVAL="${PING_INTERVAL:-30}"
 EOF
     chmod 600 "$CONF_FILE"
@@ -113,18 +113,106 @@ get_service_name() {
 }
 
 #================================================================
-# 网络检测
+# curl --interface 兼容性检测
+#================================================================
+CURL_IFACE_SUPPORT=""
+check_curl_iface() {
+    if [ -z "$CURL_IFACE_SUPPORT" ]; then
+        if curl --interface lo -s -m 1 -o /dev/null http://127.0.0.1 2>/dev/null; then
+            CURL_IFACE_SUPPORT="yes"
+        else
+            # 某些busybox curl不支持--interface，检查帮助信息
+            if curl --help 2>&1 | grep -q '\-\-interface'; then
+                CURL_IFACE_SUPPORT="yes"
+            else
+                CURL_IFACE_SUPPORT="no"
+            fi
+        fi
+    fi
+    [ "$CURL_IFACE_SUPPORT" = "yes" ]
+}
+
+# 构造curl的--interface参数（兼容不支持的情况）
+curl_iface_arg() {
+    local iface="$1"
+    if [ -z "$iface" ] || ! check_curl_iface; then
+        echo ""
+    else
+        echo "--interface $iface"
+    fi
+}
+
+#================================================================
+# 网卡枚举
+#================================================================
+get_active_ifaces() {
+    local iface_list=""
+    local configured_iface="${IFACE:-auto}"
+
+    # 如果配置了指定网卡且非auto
+    if [ "$configured_iface" != "auto" ]; then
+        # 验证指定网卡是否存在且UP
+        if ip link show "$configured_iface" 2>/dev/null | grep -q 'state UP'; then
+            # 验证已获取IP
+            if ip addr show "$configured_iface" 2>/dev/null | grep -q 'inet '; then
+                echo "$configured_iface"
+                return 0
+            else
+                print_warn "网卡 $configured_iface 已UP但未获取IP，回退到auto模式"
+            fi
+        else
+            print_warn "网卡 $configured_iface 不存在或未UP，回退到auto模式"
+        fi
+    fi
+
+    # auto模式：枚举所有活跃网卡
+    for iface in $(ip link show up 2>/dev/null | grep -oE '^[0-9]+: [^:@]+' | awk '{print $2}' | grep -v '^lo$'); do
+        # 确认已分配IPv4地址
+        if ip addr show "$iface" 2>/dev/null | grep -q 'inet '; then
+            iface_list="${iface_list}${iface_list:+ }${iface}"
+        fi
+    done
+
+    echo "$iface_list"
+}
+
+#================================================================
+# 单网卡在线检测
+#================================================================
+check_online_iface() {
+    local iface="$1"
+    local iface_arg
+    iface_arg=$(curl_iface_arg "$iface")
+
+    local code
+    code=$(curl $iface_arg -s -I -m 3 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
+    if [ "$code" = "204" ]; then
+        echo "ONLINE" > "/tmp/qhulogin_iface_status_${iface}" 2>/dev/null
+        return 0
+    fi
+    code=$(curl $iface_arg -s -I -m 3 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
+    if [ "$code" = "204" ]; then
+        echo "ONLINE" > "/tmp/qhulogin_iface_status_${iface}" 2>/dev/null
+        return 0
+    fi
+    echo "OFFLINE" > "/tmp/qhulogin_iface_status_${iface}" 2>/dev/null
+    return 1
+}
+
+#================================================================
+# 网络检测（全局）
 #================================================================
 check_online() {
-    local code
-    code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
-    if [ "$code" = "204" ]; then
-        return 0
+    local ifaces
+    ifaces=$(get_active_ifaces)
+    if [ -z "$ifaces" ]; then
+        return 1
     fi
-    code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
-    if [ "$code" = "204" ]; then
-        return 0
-    fi
+    for iface in $ifaces; do
+        if check_online_iface "$iface"; then
+            return 0
+        fi
+    done
     return 1
 }
 
@@ -160,16 +248,39 @@ rsa_encrypt_password() {
 do_logout() {
     load_config 2>/dev/null
 
-    # 从缓存获取认证服务器地址
+    # 获取第一个受管网卡用于登出
+    local ifaces
+    ifaces=$(get_active_ifaces)
+    local first_iface=""
+    for iface in $ifaces; do
+        first_iface="$iface"
+        break
+    done
+    local iface_arg
+    iface_arg=$(curl_iface_arg "$first_iface")
+
+    # 从缓存获取认证服务器地址（优先使用全局缓存）
     local login_page_url=""
     if [ -f "$CACHE_FILE" ]; then
         login_page_url=$(cat "$CACHE_FILE" 2>/dev/null)
+    fi
+    # 尝试从网卡缓存获取
+    if [ -z "$login_page_url" ] && [ -n "$first_iface" ]; then
+        local iface_cache="${CONF_DIR}/.login_cache_${first_iface}"
+        if [ -f "$iface_cache" ]; then
+            login_page_url=$(cat "$iface_cache" 2>/dev/null)
+        fi
     fi
 
     # 尝试通过网关获取
     if [ -z "$login_page_url" ]; then
         local gateway=""
-        gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+        if [ -n "$first_iface" ]; then
+            gateway=$(ip route list dev "$first_iface" 2>/dev/null | grep default | awk '{print $3}' | head -1)
+        fi
+        if [ -z "$gateway" ]; then
+            gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+        fi
         if [ -n "$gateway" ]; then
             login_page_url="http://${gateway}/eportal/index.jsp"
         fi
@@ -190,68 +301,75 @@ do_logout() {
     query_url="${logout_url/method=logout/method=getOnlineUserInfo}"
 
     local info
-    info=$(curl -s -m 10 -d "userId=${USERNAME}" "$query_url" 2>/dev/null)
+    info=$(curl $iface_arg -s -m 10 -d "userId=${USERNAME}" "$query_url" 2>/dev/null)
     if [ -n "$info" ]; then
         user_index=$(echo "$info" | grep -oE '"userIndex"\s*:\s*"[^"]*"' | sed 's/.*: *"//;s/"//')
     fi
 
     # 发送登出请求
+    local logout_result
     if [ -n "$user_index" ]; then
-        curl -s -m 10 -d "userIndex=${user_index}" "$logout_url" >/dev/null 2>&1
+        logout_result=$(curl $iface_arg -s -m 10 -d "userIndex=${user_index}" "$logout_url" 2>/dev/null)
     else
         # 没有userIndex，尝试用userId登出
-        curl -s -m 10 -d "userId=${USERNAME}" "$logout_url" >/dev/null 2>&1
+        logout_result=$(curl $iface_arg -s -m 10 -d "userId=${USERNAME}" "$logout_url" 2>/dev/null)
     fi
 
-    print_info "已发送登出请求"
-    return 0
+    if echo "$logout_result" | grep -q 'success' 2>/dev/null; then
+        print_success "已成功登出"
+        log_msg "LOGOUT" "用户 ${USERNAME} 登出成功"
+        return 0
+    else
+        print_warn "已发送登出请求（结果未知）"
+        log_msg "LOGOUT" "登出请求已发送: ${logout_result:-无响应}"
+        return 0
+    fi
 }
 
 #================================================================
-# 认证核心
+# 单网卡认证核心
 #================================================================
-do_login() {
-    local force="${1:-}"
+do_login_iface() {
+    local iface="$1"
+    local force="${2:-}"
+    local iface_arg
+    iface_arg=$(curl_iface_arg "$iface")
+    local iface_cache="${CONF_DIR}/.login_cache_${iface}"
 
     # 加载配置
     load_config 2>/dev/null
 
     # 检查配置
     if [ -z "${USERNAME:-}" ] || [ -z "${PASSWORD:-}" ]; then
-        print_error "未配置用户名或密码，请先运行 qhulogin config"
+        print_error "[${iface}] 未配置用户名或密码，请先运行 qhulogin config"
         return 1
     fi
 
-    # 非强制模式：已在线则跳过
-    if [ "$force" != "force" ] && check_online; then
-        print_success "已在线，无需认证"
+    # 非强制模式：该网卡已在线则跳过
+    if [ "$force" != "force" ] && check_online_iface "$iface"; then
+        print_success "[${iface}] 已在线，无需认证"
         return 0
     fi
 
-    print_info "开始登录..."
+    print_info "[${iface}] 开始登录..."
 
     # 获取认证页面
     local response
-    response=$(curl -s -L -m 10 "http://www.google.cn/generate_204" 2>/dev/null)
+    response=$(curl $iface_arg -s -L -m 10 "http://www.google.cn/generate_204" 2>/dev/null)
 
     # 提取登录页URL
     local login_page_url=""
     if [ -n "$response" ]; then
-        # 尝试从href='xxx'提取
         login_page_url=$(echo "$response" | grep -oE "href='[^']+'" | head -1 | sed "s/href='//;s/'//")
-        # 尝试从href="xxx"提取
         if [ -z "$login_page_url" ]; then
             login_page_url=$(echo "$response" | grep -oE 'href="[^"]+"' | head -1 | sed 's/href="//;s/"//')
         fi
-        # 尝试从location.href='xxx'提取
         if [ -z "$login_page_url" ]; then
             login_page_url=$(echo "$response" | grep -oE "location\.href='[^']+'" | head -1 | sed "s/location\.href='//;s/'//")
         fi
-        # 尝试从window.location="xxx"提取
         if [ -z "$login_page_url" ]; then
             login_page_url=$(echo "$response" | grep -oE 'window\.location="[^"]+"' | head -1 | sed 's/window\.location="//;s/"//')
         fi
-        # 尝试从meta refresh提取
         if [ -z "$login_page_url" ]; then
             login_page_url=$(echo "$response" | grep -oiE 'url=[^"]+' | head -1 | sed 's/[Uu][Rr][Ll]=//')
         fi
@@ -259,20 +377,23 @@ do_login() {
 
     # 在线但拿不到URL时，尝试其他方式获取
     if [ -z "$login_page_url" ]; then
-        # 1. 使用缓存的URL
-        if [ -f "$CACHE_FILE" ]; then
-            login_page_url=$(cat "$CACHE_FILE" 2>/dev/null)
-            print_info "使用缓存的认证URL"
+        # 1. 使用该网卡的缓存URL
+        if [ -f "$iface_cache" ]; then
+            login_page_url=$(cat "$iface_cache" 2>/dev/null)
+            print_info "[${iface}] 使用缓存的认证URL"
         else
             # 2. 通过网关IP直接访问ePortal
             local gateway=""
-            gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+            gateway=$(ip route list dev "$iface" 2>/dev/null | grep default | awk '{print $3}' | head -1)
+            if [ -z "$gateway" ]; then
+                gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+            fi
             if [ -n "$gateway" ]; then
-                print_info "尝试通过网关 $gateway 获取认证页..."
+                print_info "[${iface}] 尝试通过网关 $gateway 获取认证页..."
                 local gw_response=""
-                gw_response=$(curl -s -L -m 5 "http://${gateway}/eportal/index.jsp" 2>/dev/null)
+                gw_response=$(curl $iface_arg -s -L -m 5 "http://${gateway}/eportal/index.jsp" 2>/dev/null)
                 if [ -z "$gw_response" ]; then
-                    gw_response=$(curl -s -L -m 5 "http://${gateway}" 2>/dev/null)
+                    gw_response=$(curl $iface_arg -s -L -m 5 "http://${gateway}" 2>/dev/null)
                 fi
                 if [ -n "$gw_response" ]; then
                     login_page_url=$(echo "$gw_response" | grep -oE "href='[^']+" | head -1 | sed "s/href='//")
@@ -284,19 +405,19 @@ do_login() {
 
             # 3. 仍然拿不到，在线则跳过
             if [ -z "$login_page_url" ]; then
-                if check_online; then
-                    print_success "已在线，无法获取认证页URL（下次登录成功后会缓存）"
+                if check_online_iface "$iface"; then
+                    print_success "[${iface}] 已在线，无法获取认证页URL（下次登录成功后会缓存）"
                     return 0
                 fi
-                print_error "网络不通，无法访问认证服务器"
-                log_msg "LOGIN" "网络不通，curl无响应"
+                print_error "[${iface}] 网络不通，无法访问认证服务器"
+                log_msg "LOGIN" "[${iface}] 网络不通，curl无响应"
                 return 1
             fi
         fi
     fi
 
-    # 缓存认证页URL
-    echo "$login_page_url" > "$CACHE_FILE"
+    # 缓存认证页URL（按网卡分别缓存）
+    echo "$login_page_url" > "$iface_cache"
 
     # 构造登录URL
     local login_url
@@ -311,25 +432,25 @@ do_login() {
 
     # 获取登录页HTML，提取RSA公钥
     local login_html rsa_key encrypted_password password_encrypt
-    login_html=$(curl -s -m 10 "$login_page_url" 2>/dev/null)
+    login_html=$(curl $iface_arg -s -m 10 "$login_page_url" 2>/dev/null)
     rsa_key=$(echo "$login_html" | grep -oE 'publicKey\s*=\s*["\x27][A-Za-z0-9+/=]{100,}["\x27]' | sed "s/.*=['\"]//;s/['\"]$//")
 
     # 加密密码
     encrypted_password="$PASSWORD"
     password_encrypt="false"
     if [ -n "$rsa_key" ]; then
-        print_info "使用RSA加密密码..."
+        print_info "[${iface}] 使用RSA加密密码..."
         local enc
         enc=$(rsa_encrypt_password "$rsa_key" "$PASSWORD")
         if [ -n "$enc" ]; then
             encrypted_password="$enc"
             password_encrypt="true"
-            print_success "RSA加密成功"
+            print_success "[${iface}] RSA加密成功"
         else
-            print_warn "RSA加密失败，回退到明文模式"
+            print_warn "[${iface}] RSA加密失败，回退到明文模式"
         fi
     else
-        print_warn "未获取到RSA公钥，使用明文模式"
+        print_warn "[${iface}] 未获取到RSA公钥，使用明文模式"
     fi
 
     # 获取运营商编码
@@ -337,9 +458,9 @@ do_login() {
     service_string=$(get_service_string "${SERVICE:-campus}")
 
     # 发送认证请求
-    print_info "发送认证请求..."
+    print_info "[${iface}] 发送认证请求..."
     local result
-    result=$(curl -s -m 15 \
+    result=$(curl $iface_arg -s -m 15 \
         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36" \
         -e "$login_page_url" \
         -H "Accept: */*" \
@@ -348,28 +469,85 @@ do_login() {
         "$login_url" 2>/dev/null)
 
     if [ -z "$result" ]; then
-        print_error "认证请求无响应"
+        print_error "[${iface}] 认证请求无响应"
         return 1
     fi
 
     # 判断结果
     if echo "$result" | grep -q '"success"' 2>/dev/null; then
-        print_success "认证成功!"
-        log_msg "LOGIN" "用户 ${USERNAME} 认证成功"
+        print_success "[${iface}] 认证成功!"
+        log_msg "LOGIN" "[${iface}] 用户 ${USERNAME} 认证成功"
         return 0
     elif echo "$result" | grep -q 'success' 2>/dev/null; then
-        print_success "认证成功!"
-        log_msg "LOGIN" "用户 ${USERNAME} 认证成功"
+        print_success "[${iface}] 认证成功!"
+        log_msg "LOGIN" "[${iface}] 用户 ${USERNAME} 认证成功"
         return 0
     else
-        # 检查是否"同时在线用户数量上限"
         if echo "$result" | grep -q '同时在线用户数量上限' 2>/dev/null; then
-            print_error "认证失败: 账号在其他设备在线"
-            log_msg "LOGIN" "认证失败: 多设备在线上限"
+            print_error "[${iface}] 认证失败: 账号在其他设备在线"
+            log_msg "LOGIN" "[${iface}] 认证失败: 多设备在线上限"
             return 2
         fi
-        print_error "认证失败: $(echo "$result" | head -c 200)"
-        log_msg "LOGIN" "认证失败: $result"
+        print_error "[${iface}] 认证失败: $(echo "$result" | head -c 200)"
+        log_msg "LOGIN" "[${iface}] 认证失败: $result"
+        return 1
+    fi
+}
+
+#================================================================
+# 认证核心（多网卡调度）
+#================================================================
+do_login() {
+    local force="${1:-}"
+
+    # 加载配置
+    load_config 2>/dev/null
+
+    # 检查配置
+    if [ -z "${USERNAME:-}" ] || [ -z "${PASSWORD:-}" ]; then
+        print_error "未配置用户名或密码，请先运行 qhulogin config"
+        return 1
+    fi
+
+    # 获取受管网卡列表
+    local ifaces
+    ifaces=$(get_active_ifaces)
+    if [ -z "$ifaces" ]; then
+        print_error "未检测到活跃网卡"
+        return 1
+    fi
+
+    # 非强制模式：如果所有网卡都在线则跳过
+    if [ "$force" != "force" ]; then
+        local all_online=true
+        for iface in $ifaces; do
+            if ! check_online_iface "$iface"; then
+                all_online=false
+                break
+            fi
+        done
+        if [ "$all_online" = "true" ]; then
+            print_success "所有网卡已在线，无需认证"
+            return 0
+        fi
+    fi
+
+    # 遍历每个网卡，对离线网卡执行认证
+    local any_success=false
+    local any_fail=false
+    for iface in $ifaces; do
+        do_login_iface "$iface" "$force"
+        local ret=$?
+        if [ $ret -eq 0 ]; then
+            any_success=true
+        else
+            any_fail=true
+        fi
+    done
+
+    if [ "$any_success" = "true" ]; then
+        return 0
+    else
         return 1
     fi
 }
@@ -383,22 +561,38 @@ do_keepalive() {
         return 1
     fi
 
+    local ifaces
+    ifaces=$(get_active_ifaces)
+    if [ -z "$ifaces" ]; then
+        print_error "未检测到活跃网卡"
+        return 1
+    fi
+
     print_info "qhulogin 保活模式启动"
     print_info "用户: ${USERNAME}  运营商: $(get_service_name "${SERVICE:-campus}")"
-    print_info "检测间隔: ${PING_INTERVAL:-30}s"
+    print_info "受管网卡: ${ifaces}  检测间隔: ${PING_INTERVAL:-30}s"
 
     # 写入PID
     echo $$ > "$PID_FILE"
 
-    # 初始认证（带重试）
+    # 初始认证（带重试+退避）
     local retry=0
+    local backoff=5
     while [ $retry -lt 30 ]; do
-        if do_login; then
+        do_login
+        local ret=$?
+        if [ $ret -eq 0 ]; then
             break
         fi
         retry=$((retry + 1))
-        print_warn "初始认证未成功，5秒后重试 ($retry/30)"
-        sleep 5
+        if [ $ret -eq 2 ]; then
+            backoff=120
+            print_warn "多设备在线冲突，${backoff}秒后重试 ($retry/30)"
+        else
+            backoff=5
+            print_warn "初始认证未成功，${backoff}秒后重试 ($retry/30)"
+        fi
+        sleep "$backoff"
     done
 
     # 保活循环
@@ -406,33 +600,34 @@ do_keepalive() {
     while true; do
         sleep "$interval"
 
-        # 用HTTP检测认证状态
-        if check_online; then
-            continue
-        fi
+        # 逐网卡检测认证状态
+        local need_reconnect=false
+        for iface in $ifaces; do
+            if ! check_online_iface "$iface"; then
+                print_warn "[${iface}] 认证掉线或网络断开，尝试重新认证..."
+                log_msg "KEEPALIVE" "[${iface}] 检测到掉线，重新认证"
+                need_reconnect=true
 
-        print_warn "认证掉线或网络断开，尝试重新认证..."
-        log_msg "KEEPALIVE" "检测到掉线，重新认证"
-
-        # 重新认证，带退避重试
-        local reconnect=0
-        local backoff=10
-        while true; do
-            do_login
-            local ret=$?
-            if [ $ret -eq 0 ]; then
-                break
+                # 对该网卡重新认证，带退避重试
+                local reconnect=0
+                local backoff=10
+                while true; do
+                    do_login_iface "$iface" force
+                    local ret=$?
+                    if [ $ret -eq 0 ]; then
+                        break
+                    fi
+                    reconnect=$((reconnect + 1))
+                    if [ $ret -eq 2 ]; then
+                        backoff=120
+                        print_warn "[${iface}] 多设备在线冲突，${backoff}秒后重试 (第${reconnect}次)"
+                    else
+                        backoff=10
+                        print_warn "[${iface}] 重连失败，${backoff}秒后重试 (第${reconnect}次)"
+                    fi
+                    sleep "$backoff"
+                done
             fi
-            reconnect=$((reconnect + 1))
-            # "在线上限"错误(ret=2)增加退避，避免疯狂重试
-            if [ $ret -eq 2 ]; then
-                backoff=120
-                print_warn "多设备在线冲突，${backoff}秒后重试 (第${reconnect}次)"
-            else
-                backoff=10
-                print_warn "重连失败，${backoff}秒后重试 (第${reconnect}次)"
-            fi
-            sleep "$backoff"
         done
     done
 }
@@ -445,17 +640,27 @@ do_status() {
     echo -e "${BOLD}   GHU 校园网登录 - 状态${NC}"
     echo -e "${BOLD}========================================${NC}"
 
-    # 在线状态
-    if check_online; then
-        echo -e "  网络状态: ${GREEN}● 在线${NC}"
+    # 每个网卡的在线状态
+    local ifaces
+    ifaces=$(get_active_ifaces)
+    if [ -n "$ifaces" ]; then
+        echo -e "  网卡状态:"
+        for iface in $ifaces; do
+            if check_online_iface "$iface"; then
+                echo -e "    ${iface}: ${GREEN}● 在线${NC}"
+            else
+                echo -e "    ${iface}: ${RED}● 离线${NC}"
+            fi
+        done
     else
-        echo -e "  网络状态: ${RED}● 离线${NC}"
+        echo -e "  网卡状态: ${RED}无活跃网卡${NC}"
     fi
 
     # 配置信息
     if load_config; then
         echo -e "  用户名:   ${USERNAME:-未配置}"
         echo -e "  运营商:   $(get_service_name "${SERVICE:-campus}")"
+        echo -e "  网卡模式: ${IFACE:-auto}"
     else
         echo -e "  配置:     ${RED}未配置${NC}"
     fi
@@ -525,9 +730,12 @@ do_config() {
     read -r input
     USERNAME="${input:-${USERNAME:-}}"
 
-    # 密码
-    printf "  密码 [${PASSWORD:-}]: "
+    # 密码（隐藏输入）
+    printf "  密码 [****]: "
+    stty -echo 2>/dev/null
     read -r input
+    stty echo 2>/dev/null
+    echo ""
     PASSWORD="${input:-${PASSWORD:-}}"
 
     # 运营商
@@ -546,6 +754,26 @@ do_config() {
         *) SERVICE="${SERVICE:-campus}" ;;
     esac
 
+    # 网卡选择
+    echo ""
+    echo -e "  ${CYAN}a${NC}) auto (自动检测所有活跃网卡)"
+    # 列出当前活跃网卡
+    local active_ifaces
+    active_ifaces=$(get_active_ifaces)
+    if [ -n "$active_ifaces" ]; then
+        local idx=1
+        for iface in $active_ifaces; do
+            echo -e "  ${CYAN}${idx}${NC}) ${iface}"
+            idx=$((idx + 1))
+        done
+    fi
+    printf "  选择网卡 [a/网卡名, 当前: ${IFACE:-auto}]: "
+    read -r input
+    case "$input" in
+        a|A|"") IFACE="${IFACE:-auto}" ;;
+        *)      IFACE="$input" ;;
+    esac
+
     echo ""
     save_config
 
@@ -554,6 +782,7 @@ do_config() {
     echo -e "  用户名: ${USERNAME}"
     echo -e "  密码:   ****"
     echo -e "  运营商: $(get_service_name "$SERVICE")"
+    echo -e "  网卡:   ${IFACE}"
 }
 
 #================================================================
@@ -697,7 +926,7 @@ do_update() {
         "$INIT_SCRIPT" stop 2>/dev/null
     fi
 
-    # 替换脚本
+    # 替换脚本（先备份，验证后删除备份）
     local target
     if [ -x /usr/bin/qhulogin ]; then
         target="/usr/bin/qhulogin"
@@ -705,9 +934,22 @@ do_update() {
         target=$(readlink -f "$0" 2>/dev/null || echo "$0")
     fi
 
+    # 备份当前版本
+    cp "$target" "${target}.bak" 2>/dev/null
+
     cp "$tmp_file" "$target"
     chmod +x "$target"
     rm -f "$tmp_file"
+
+    # 验证新脚本可执行
+    if ! sh -n "$target" 2>/dev/null; then
+        print_error "新脚本语法错误，回滚到旧版本"
+        cp "${target}.bak" "$target" 2>/dev/null
+        chmod +x "$target"
+        rm -f "${target}.bak"
+        return 1
+    fi
+    rm -f "${target}.bak"
 
     if [ -n "$new_ver" ]; then
         print_success "已更新到版本 $new_ver"
@@ -816,6 +1058,7 @@ show_help() {
     echo -e "${BOLD}命令:${NC}"
     echo -e "  ${CYAN}login${NC}       立即认证"
     echo -e "  ${CYAN}relogin${NC}     强制重新认证(即使已在线)"
+    echo -e "  ${CYAN}logout${NC}      登出当前账号"
     echo -e "  ${CYAN}status${NC}      查看状态"
     echo -e "  ${CYAN}logs${NC}        查看日志"
     echo -e "  ${CYAN}config${NC}      交互式配置"
