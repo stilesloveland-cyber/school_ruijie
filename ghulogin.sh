@@ -117,13 +117,11 @@ get_service_name() {
 #================================================================
 check_online() {
     local code
-    # 主检测点
-    code=$(curl -s -I -m 5 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
+    code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
     if [ "$code" = "204" ]; then
         return 0
     fi
-    # 备选检测点
-    code=$(curl -s -I -m 5 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
+    code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
     if [ "$code" = "204" ]; then
         return 0
     fi
@@ -154,6 +152,59 @@ rsa_encrypt_password() {
     else
         return 1
     fi
+}
+
+#================================================================
+# 登出（踢出旧会话）
+#================================================================
+do_logout() {
+    load_config 2>/dev/null
+
+    # 从缓存获取认证服务器地址
+    local login_page_url=""
+    if [ -f "$CACHE_FILE" ]; then
+        login_page_url=$(cat "$CACHE_FILE" 2>/dev/null)
+    fi
+
+    # 尝试通过网关获取
+    if [ -z "$login_page_url" ]; then
+        local gateway=""
+        gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+        if [ -n "$gateway" ]; then
+            login_page_url="http://${gateway}/eportal/index.jsp"
+        fi
+    fi
+
+    if [ -z "$login_page_url" ]; then
+        return 1
+    fi
+
+    # 构造登出URL
+    local logout_url
+    logout_url=$(echo "$login_page_url" | awk -F '?' '{print $1}')
+    logout_url="${logout_url/index.jsp/InterFace.do?method=logout}"
+
+    # 获取userIndex（需要先查询在线用户信息）
+    local user_index=""
+    local query_url
+    query_url="${logout_url/method=logout/method=getOnlineUserInfo}"
+
+    local info
+    info=$(curl -s -m 10 -d "userId=${USERNAME}" "$query_url" 2>/dev/null)
+    if [ -n "$info" ]; then
+        user_index=$(echo "$info" | grep -oE '"userIndex"\s*:\s*"[^"]*"' | sed 's/.*: *"//;s/"//')
+    fi
+
+    # 发送登出请求
+    if [ -n "$user_index" ]; then
+        curl -s -m 10 -d "userIndex=${user_index}" "$logout_url" >/dev/null 2>&1
+    else
+        # 没有userIndex，尝试用userId登出
+        curl -s -m 10 -d "userId=${USERNAME}" "$logout_url" >/dev/null 2>&1
+    fi
+
+    print_info "已发送登出请求"
+    return 0
 }
 
 #================================================================
@@ -311,6 +362,12 @@ do_login() {
         log_msg "LOGIN" "用户 ${USERNAME} 认证成功"
         return 0
     else
+        # 检查是否"同时在线用户数量上限"
+        if echo "$result" | grep -q '同时在线用户数量上限' 2>/dev/null; then
+            print_error "认证失败: 账号在其他设备在线"
+            log_msg "LOGIN" "认证失败: 多设备在线上限"
+            return 2
+        fi
         print_error "认证失败: $(echo "$result" | head -c 200)"
         log_msg "LOGIN" "认证失败: $result"
         return 1
@@ -349,7 +406,7 @@ do_keepalive() {
     while true; do
         sleep "$interval"
 
-        # 用HTTP检测认证状态（Ping不经过ePortal，无法检测认证掉线）
+        # 用HTTP检测认证状态
         if check_online; then
             continue
         fi
@@ -357,15 +414,25 @@ do_keepalive() {
         print_warn "认证掉线或网络断开，尝试重新认证..."
         log_msg "KEEPALIVE" "检测到掉线，重新认证"
 
-        # 重新认证，无限重试
+        # 重新认证，带退避重试
         local reconnect=0
+        local backoff=10
         while true; do
-            if do_login; then
+            do_login
+            local ret=$?
+            if [ $ret -eq 0 ]; then
                 break
             fi
             reconnect=$((reconnect + 1))
-            print_warn "重连失败，10秒后重试 (第${reconnect}次)"
-            sleep 10
+            # "在线上限"错误(ret=2)增加退避，避免疯狂重试
+            if [ $ret -eq 2 ]; then
+                backoff=120
+                print_warn "多设备在线冲突，${backoff}秒后重试 (第${reconnect}次)"
+            else
+                backoff=10
+                print_warn "重连失败，${backoff}秒后重试 (第${reconnect}次)"
+            fi
+            sleep "$backoff"
         done
     done
 }
@@ -616,8 +683,10 @@ do_update() {
         return 0
     fi
 
-    if [ -n "$new_ver" ]; then
+    if [ -n "$new_ver" ] && [ "$current_ver" != "$new_ver" ]; then
         print_info "发现新版本: ${current_ver:-未知} → $new_ver"
+    elif [ -n "$new_ver" ] && [ "$current_ver" = "$new_ver" ]; then
+        print_info "检测到文件变更 (${current_ver})，准备更新"
     else
         print_info "发现文件变更，准备更新"
     fi
@@ -681,23 +750,35 @@ show_menu() {
         echo -e "${BOLD}     GHU 校园网登录管理${NC}"
         echo -e "${BOLD}========================================${NC}"
 
-        # 显示简要状态
-        if check_online 2>/dev/null; then
-            echo -e "  状态: ${GREEN}● 在线${NC}"
-        else
-            echo -e "  状态: ${RED}● 离线${NC}"
+        # 显示简要状态（后台检测，不阻塞菜单）
+        local status="● 检测中..."
+        (
+            if check_online 2>/dev/null; then
+                echo "ONLINE" > /tmp/qhulogin_status 2>/dev/null
+            else
+                echo "OFFLINE" > /tmp/qhulogin_status 2>/dev/null
+            fi
+        ) &
+        if [ -f /tmp/qhulogin_status ]; then
+            if grep -q "ONLINE" /tmp/qhulogin_status 2>/dev/null; then
+                status="${GREEN}● 在线${NC}"
+            else
+                status="${RED}● 离线${NC}"
+            fi
         fi
+        echo -e "  状态: $status"
 
         echo ""
         echo -e "  ${CYAN}1${NC}) 立即登录"
         echo -e "  ${CYAN}2${NC}) 强制重新登录"
-        echo -e "  ${CYAN}3${NC}) 查看状态"
-        echo -e "  ${CYAN}4${NC}) 查看日志"
-        echo -e "  ${CYAN}5${NC}) 配置账号"
-        echo -e "  ${CYAN}6${NC}) 启动保活"
-        echo -e "  ${CYAN}7${NC}) 停止保活"
-        echo -e "  ${CYAN}8${NC}) 安装到系统"
-        echo -e "  ${CYAN}9${NC}) 卸载"
+        echo -e "  ${CYAN}3${NC}) 登出"
+        echo -e "  ${CYAN}4${NC}) 查看状态"
+        echo -e "  ${CYAN}5${NC}) 查看日志"
+        echo -e "  ${CYAN}6${NC}) 配置账号"
+        echo -e "  ${CYAN}7${NC}) 启动保活"
+        echo -e "  ${CYAN}8${NC}) 停止保活"
+        echo -e "  ${CYAN}9${NC}) 安装到系统"
+        echo -e "  ${CYAN}d${NC}) 卸载"
         echo -e "  ${CYAN}u${NC}) 检查更新"
         echo -e "  ${CYAN}0${NC}) 退出"
         echo ""
@@ -707,13 +788,14 @@ show_menu() {
         case "$choice" in
             1) do_login ;;
             2) do_login force ;;
-            3) do_status ;;
-            4) do_logs ;;
-            5) do_config ;;
-            6) do_service_ctrl start ;;
-            7) do_service_ctrl stop ;;
-            8) do_install ;;
-            9) do_uninstall ;;
+            3) do_logout ;;
+            4) do_status ;;
+            5) do_logs ;;
+            6) do_config ;;
+            7) do_service_ctrl start ;;
+            8) do_service_ctrl stop ;;
+            9) do_install ;;
+            d) do_uninstall ;;
             u) do_update ;;
             0) echo -e "${GRAY}再见!${NC}"; exit 0 ;;
             *) print_error "无效选择" ;;
@@ -760,6 +842,7 @@ main() {
     case "$cmd" in
         login)      do_login ;;
         relogin)    do_login force ;;
+        logout)     do_logout ;;
         status)     do_status ;;
         logs)       do_logs ;;
         config)     do_config ;;
