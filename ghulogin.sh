@@ -206,19 +206,41 @@ do_login() {
         fi
     fi
 
-    # 在线但拿不到URL时，使用缓存的URL
+    # 在线但拿不到URL时，尝试其他方式获取
     if [ -z "$login_page_url" ]; then
+        # 1. 使用缓存的URL
         if [ -f "$CACHE_FILE" ]; then
             login_page_url=$(cat "$CACHE_FILE" 2>/dev/null)
             print_info "使用缓存的认证URL"
         else
-            if check_online; then
-                print_success "已在线，无需重新认证"
-                return 0
+            # 2. 通过网关IP直接访问ePortal
+            local gateway=""
+            gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+            if [ -n "$gateway" ]; then
+                print_info "尝试通过网关 $gateway 获取认证页..."
+                local gw_response=""
+                gw_response=$(curl -s -L -m 5 "http://${gateway}/eportal/index.jsp" 2>/dev/null)
+                if [ -z "$gw_response" ]; then
+                    gw_response=$(curl -s -L -m 5 "http://${gateway}" 2>/dev/null)
+                fi
+                if [ -n "$gw_response" ]; then
+                    login_page_url=$(echo "$gw_response" | grep -oE "href='[^']+" | head -1 | sed "s/href='//")
+                    if [ -z "$login_page_url" ]; then
+                        login_page_url=$(echo "$gw_response" | grep -oE 'href="[^"]+' | head -1 | sed 's/href="//')
+                    fi
+                fi
             fi
-            print_error "网络不通，无法访问认证服务器"
-            log_msg "LOGIN" "网络不通，curl无响应"
-            return 1
+
+            # 3. 仍然拿不到，在线则跳过
+            if [ -z "$login_page_url" ]; then
+                if check_online; then
+                    print_success "已在线，无法获取认证页URL（下次登录成功后会缓存）"
+                    return 0
+                fi
+                print_error "网络不通，无法访问认证服务器"
+                log_msg "LOGIN" "网络不通，curl无响应"
+                return 1
+            fi
         fi
     fi
 
