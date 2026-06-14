@@ -524,7 +524,7 @@ do_uninstall() {
 # 更新
 #================================================================
 do_update() {
-    local repo="https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/main/qhulogin.sh"
+    local repo="https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/master/ghulogin.sh"
     local tmp_file="/tmp/qhulogin_update.sh"
 
     print_info "正在检查更新..."
