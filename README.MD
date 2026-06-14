@@ -16,7 +16,7 @@
 
 ```bash
 # 从GitHub下载
-curl -o ghulogin.sh https://raw.githubusercontent.com/theshdowaura/school_ruijie/master/ghulogin.sh
+curl -o ghulogin.sh https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/master/ghulogin.sh
 
 # 安装到系统
 sh ghulogin.sh install
