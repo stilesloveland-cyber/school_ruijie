@@ -30,6 +30,7 @@ readonly CONF_FILE="${CONF_DIR}/qhulogin.conf"
 readonly LOG_FILE="/var/log/qhulogin.log"
 readonly PID_FILE="/var/run/qhulogin.pid"
 readonly INIT_SCRIPT="/etc/init.d/qhulogin"
+readonly CACHE_FILE="${CONF_DIR}/.login_cache"
 
 #================================================================
 # 运营商映射
@@ -170,7 +171,7 @@ do_login() {
         return 1
     fi
 
-    # 检测网络（强制模式跳过在线检测，但仍需获取认证页）
+    # 非强制模式：已在线则跳过
     if [ "$force" != "force" ] && check_online; then
         print_success "已在线，无需认证"
         return 0
@@ -182,42 +183,47 @@ do_login() {
     local response
     response=$(curl -s -L -m 10 "http://www.google.cn/generate_204" 2>/dev/null)
 
-    # 强制模式且已在线时，response可能为空(204无内容)
-    if [ -z "$response" ]; then
-        if check_online; then
-            print_success "已在线，无需重新认证"
-            return 0
+    # 提取登录页URL
+    local login_page_url
+    if [ -n "$response" ]; then
+        # 尝试从href='xxx'提取
+        login_page_url=$(echo "$response" | grep -oE "href='[^']+'" | head -1 | sed "s/href='//;s/'//")
+        # 尝试从href="xxx"提取
+        if [ -z "$login_page_url" ]; then
+            login_page_url=$(echo "$response" | grep -oE 'href="[^"]+"' | head -1 | sed 's/href="//;s/"//')
         fi
-        print_error "网络不通，无法访问认证服务器"
-        log_msg "LOGIN" "网络不通，curl无响应"
-        return 1
+        # 尝试从location.href='xxx'提取
+        if [ -z "$login_page_url" ]; then
+            login_page_url=$(echo "$response" | grep -oE "location\.href='[^']+'" | head -1 | sed "s/location\.href='//;s/'//")
+        fi
+        # 尝试从window.location="xxx"提取
+        if [ -z "$login_page_url" ]; then
+            login_page_url=$(echo "$response" | grep -oE 'window\.location="[^"]+"' | head -1 | sed 's/window\.location="//;s/"//')
+        fi
+        # 尝试从meta refresh提取
+        if [ -z "$login_page_url" ]; then
+            login_page_url=$(echo "$response" | grep -oiE 'url=[^"]+' | head -1 | sed 's/[Uu][Rr][Ll]=//')
+        fi
     fi
 
-    # 提取登录页URL (多种格式: JS跳转/location.href/meta refresh/直接URL)
-    local login_page_url
-    # 尝试从href='xxx'提取
-    login_page_url=$(echo "$response" | grep -oE "href='[^']+'" | head -1 | sed "s/href='//;s/'//")
-    # 尝试从href="xxx"提取
+    # 在线但拿不到URL时，使用缓存的URL
     if [ -z "$login_page_url" ]; then
-        login_page_url=$(echo "$response" | grep -oE 'href="[^"]+"' | head -1 | sed 's/href="//;s/"//')
+        if [ -f "$CACHE_FILE" ]; then
+            login_page_url=$(cat "$CACHE_FILE" 2>/dev/null)
+            print_info "使用缓存的认证URL"
+        else
+            if check_online; then
+                print_success "已在线，无需重新认证"
+                return 0
+            fi
+            print_error "网络不通，无法访问认证服务器"
+            log_msg "LOGIN" "网络不通，curl无响应"
+            return 1
+        fi
     fi
-    # 尝试从location.href='xxx'提取
-    if [ -z "$login_page_url" ]; then
-        login_page_url=$(echo "$response" | grep -oE "location\.href='[^']+'" | head -1 | sed "s/location\.href='//;s/'//")
-    fi
-    # 尝试从window.location="xxx"提取
-    if [ -z "$login_page_url" ]; then
-        login_page_url=$(echo "$response" | grep -oE 'window\.location="[^"]+"' | head -1 | sed 's/window\.location="//;s/"//')
-    fi
-    # 尝试从meta refresh提取
-    if [ -z "$login_page_url" ]; then
-        login_page_url=$(echo "$response" | grep -oiE 'url=[^"]+' | head -1 | sed 's/[Uu][Rr][Ll]=//')
-    fi
-    if [ -z "$login_page_url" ]; then
-        print_error "无法从响应中提取登录页URL"
-        log_msg "LOGIN" "响应内容: $(echo "$response" | head -c 500)"
-        return 1
-    fi
+
+    # 缓存认证页URL
+    echo "$login_page_url" > "$CACHE_FILE"
 
     # 构造登录URL
     local login_url
