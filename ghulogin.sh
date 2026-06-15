@@ -160,21 +160,32 @@ EOF
 }
 
 check_online() {
-    # 主路径：ePortal API 直连检测（10.x.x.x 内网地址不走 Clash）
+    # 主路径：逐接口检测 ePortal API（10.x.x.x 内网地址不走 Clash）
     local gateway
     gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
     if [ -n "$gateway" ] && [ -n "${USERNAME:-}" ]; then
-        local user_info
-        user_info=$(curl -s -m 3 -d "userId=${USERNAME}" \
-            "http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
-        if echo "$user_info" | grep -qE '"userIndex"\s*:\s*".+"' 2>/dev/null; then
-            return 0
-        fi
+        for iface in $(detect_wlan_clients); do
+            local user_info
+            # 对每个接口尝试检测（用 --interface 绑定或路由切换）
+            if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
+                # 优先用 su nobody --interface 绕过 Clash 并绑定接口
+                user_info=$(su -s /bin/sh nobody -c "curl --interface $iface -s -m 3 -d \"userId=${USERNAME}\" http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
+                # 如果 --interface 失败，回退到路由切换
+                if [ -z "$user_info" ]; then
+                    user_info=$(check_online_via_route "$gateway" "$iface" "$USERNAME")
+                fi
+            else
+                # 没有 su/nobody，直接 curl（可能被 Clash 欺骗）
+                user_info=$(curl -s -m 3 -d "userId=${USERNAME}" \
+                    "http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
+            fi
+            if echo "$user_info" | grep -qE '"userIndex"\s*:\s*".+"' 2>/dev/null; then
+                return 0
+            fi
+        done
     fi
 
     # 备选：generate_204 检测（尝试以 nobody 用户绕过 Clash iptables REDIRECT）
-    # OpenClash openclash_output 链有 -m owner --gid-owner 65534 -j RETURN 规则
-    # 以 nobody(GID 65534) 身份运行 curl 可绕过 OUTPUT 链劫持
     local code
     if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
         code=$(su -s /bin/sh nobody -c "curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204" 2>/dev/null)
@@ -184,6 +195,45 @@ check_online() {
     [ "$code" = "204" ] && return 0
 
     return 1
+}
+
+# 通过路由切换检测指定接口的在线状态
+check_online_via_route() {
+    local gateway="$1"
+    local iface="$2"
+    local username="$3"
+    
+    local other_table
+    other_table=$(find_route_table "$iface")
+    
+    local orig_route=""
+    if [ -n "$other_table" ]; then
+        orig_route=$(ip route show table "$other_table" default dev "$iface" 2>/dev/null | head -1)
+    else
+        orig_route=$(ip route show default dev "$iface" 2>/dev/null | head -1)
+    fi
+    
+    if [ -n "$other_table" ]; then
+        ip route del default dev "$iface" table "$other_table" 2>/dev/null
+    fi
+    ip route del default dev "$iface" 2>/dev/null
+    ip route add default via "$gateway" dev "$iface" metric 1 2>/dev/null
+    
+    local result
+    result=$(su -s /bin/sh nobody -c "curl -s -m 3 -d \"userId=${username}\" http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
+    
+    ip route del default via "$gateway" dev "$iface" metric 1 2>/dev/null
+    if [ -n "$orig_route" ]; then
+        local restore_route
+        restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
+        if [ -n "$other_table" ]; then
+            ip route add $restore_route table "$other_table" 2>/dev/null
+        else
+            ip route add $restore_route 2>/dev/null
+        fi
+    fi
+    
+    echo "$result"
 }
 
 check_all_online() {
@@ -761,28 +811,43 @@ do_status() {
     echo -e "${BOLD}   GHU 校园网登录 - 状态${NC}"
     echo -e "${BOLD}========================================${NC}"
 
-    # 在线状态
-    if check_all_online; then
-        echo -e "  网络状态: ${GREEN}● 在线${NC}"
-        # 显示各WLAN客户端（通过路由表判断，包括 mwan3 策略路由表）
-        for iface in $(detect_wlan_clients); do
-            # 检查该接口是否有默认路由（主表 + 所有策略路由表）
-            local has_route
-            has_route=$(( $(ip route show default 2>/dev/null | grep -c "dev $iface") + $(ip route show table all default 2>/dev/null | grep -c "dev $iface") ))
-            if [ "$has_route" -gt 0 ]; then
-                local iface_ip
-                iface_ip=$(ip addr show dev "$iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
-                if [ -n "$iface_ip" ]; then
-                    echo -e "    ${iface}: ${GREEN}● 已接入${NC} ($iface_ip)"
-                else
-                    echo -e "    ${iface}: ${GREEN}● 已接入${NC}"
-                fi
+    # 在线状态 - 逐个检测接口
+    local online_count=0
+    local total_count=0
+    local all_online=true
+    
+    echo -e "  网络状态:"
+    for iface in $(detect_wlan_clients); do
+        total_count=$((total_count + 1))
+        local iface_ip
+        iface_ip=$(ip addr show dev "$iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
+        
+        if check_iface_online "$iface"; then
+            online_count=$((online_count + 1))
+            if [ -n "$iface_ip" ]; then
+                echo -e "    ${iface}: ${GREEN}● 在线${NC} ($iface_ip)"
             else
-                echo -e "    ${iface}: ${GRAY}○ 备用${NC}"
+                echo -e "    ${iface}: ${GREEN}● 在线${NC}"
             fi
-        done
+        else
+            all_online=false
+            if [ -n "$iface_ip" ]; then
+                echo -e "    ${iface}: ${RED}● 离线${NC} ($iface_ip)"
+            else
+                echo -e "    ${iface}: ${RED}● 离线${NC}"
+            fi
+        fi
+    done
+    
+    # 显示汇总状态
+    if [ "$total_count" -eq 0 ]; then
+        echo -e "    ${GRAY}无可用WAN接口${NC}"
+    elif $all_online; then
+        echo -e "    ${GREEN}● 全部在线${NC} (${online_count}/${total_count})"
+    elif [ "$online_count" -eq 0 ]; then
+        echo -e "    ${RED}● 全部离线${NC} (${online_count}/${total_count})"
     else
-        echo -e "  网络状态: ${RED}● 离线${NC}"
+        echo -e "    ${YELLOW}● 部分在线${NC} (${online_count}/${total_count})"
     fi
 
     # 配置信息
