@@ -1,7 +1,7 @@
 #!/bin/sh
 #================================================================
 # qhulogin - 锐捷ePortal自动认证工具
-# Version: 1.5.0
+# Version: 1.6.0
 # 功能：校园网自动登录 + 保活重连 + 命令行管理
 # 平台：iStoreOS/OpenWrt (斐讯N1)
 # 用法：qhulogin [命令]
@@ -36,7 +36,20 @@ readonly CACHE_FILE="${CONF_DIR}/.login_cache"
 # 多网卡检测（只检测Client模式无线网卡）
 #================================================================
 detect_wlan_clients() {
-    # 从主路由表和 mwan3 策略路由表获取所有有默认路由的接口
+    # 优先使用用户配置的 WAN 接口列表
+    if [ -n "${WAN_INTERFACES:-}" ]; then
+        local result=""
+        for iface in $WAN_INTERFACES; do
+            if ip link show "$iface" >/dev/null 2>&1; then
+                result="$result $iface"
+            fi
+        done
+        if [ -n "$result" ]; then
+            echo "$result" | tr ' ' '\n' | grep -v '^$' | sort -u
+            return
+        fi
+    fi
+    # 回退到自动检测：从主路由表和 mwan3 策略路由表获取所有有默认路由的接口
     # 过滤掉 br-lan/docker0 等非无线接口，只保留 wlan*/eth*.* (VLAN子接口)
     (ip route show default 2>/dev/null; ip route show table all 2>/dev/null | grep '^default') | \
         awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | \
@@ -98,6 +111,8 @@ USERNAME="${USERNAME}"
 PASSWORD="${PASSWORD}"
 SERVICE="${SERVICE}"
 PING_INTERVAL="${PING_INTERVAL:-30}"
+WAN_INTERFACES="${WAN_INTERFACES:-}"
+FORCE_RELOGIN_AT="${FORCE_RELOGIN_AT:-}"
 EOF
     chmod 600 "$CONF_FILE"
     print_success "配置已保存到 $CONF_FILE"
@@ -174,6 +189,122 @@ check_online() {
 check_all_online() {
     load_config 2>/dev/null
     check_online
+}
+
+#================================================================
+# 单接口在线检测（切路由到指定接口，用 generate_204 检测是否已认证）
+# 未认证时 ePortal 网关返回 302（10.x.x.x 不走 Clash），不会被欺骗
+# 已认证时返回 204（可能被 Clash 欺骗，但此时确实在线，误判无害）
+#================================================================
+check_iface_online() {
+    local iface="$1"
+    local gateway
+    gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+    if [ -z "$gateway" ]; then
+        return 1
+    fi
+
+    # 查找该接口所在的策略路由表
+    local other_table
+    other_table=$(find_route_table "$iface")
+
+    # 备份原路由信息
+    local orig_route=""
+    if [ -n "$other_table" ]; then
+        orig_route=$(ip route show table "$other_table" default dev "$iface" 2>/dev/null | head -1)
+    else
+        orig_route=$(ip route show default dev "$iface" 2>/dev/null | head -1)
+    fi
+
+    # 切换路由到目标接口
+    if [ -n "$other_table" ]; then
+        ip route del default dev "$iface" table "$other_table" 2>/dev/null
+    fi
+    ip route del default dev "$iface" 2>/dev/null
+    ip route add default via "$gateway" dev "$iface" metric 1 2>/dev/null
+
+    # 检测：未认证时 ePortal 返回 302，已认证返回 204
+    local code
+    code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
+
+    # 恢复路由
+    ip route del default via "$gateway" dev "$iface" metric 1 2>/dev/null
+    if [ -n "$orig_route" ]; then
+        local restore_route
+        restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
+        if [ -n "$other_table" ]; then
+            ip route add $restore_route table "$other_table" 2>/dev/null || \
+                print_warn "恢复 $iface 路由到 table $other_table 失败"
+        else
+            ip route add $restore_route 2>/dev/null || \
+                print_warn "恢复 $iface 路由失败"
+        fi
+    else
+        print_warn "$iface 原路由信息为空，跳过恢复"
+    fi
+
+    [ "$code" = "204" ] && return 0
+    return 1
+}
+
+#================================================================
+# 切换路由到指定接口并执行认证，完成后恢复路由
+# 复用于 do_login 多网卡认证 + keepalive 逐接口保活
+#================================================================
+switch_route_and_login() {
+    local iface="$1"
+    local gateway
+    gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+    if [ -z "$gateway" ]; then
+        print_error "无法获取网关地址"
+        return 1
+    fi
+
+    print_info "从 $iface 发起认证..."
+
+    # 查找该接口所在的策略路由表
+    local other_table
+    other_table=$(find_route_table "$iface")
+
+    # 备份原路由信息
+    local orig_route=""
+    if [ -n "$other_table" ]; then
+        orig_route=$(ip route show table "$other_table" default dev "$iface" 2>/dev/null | head -1)
+    else
+        orig_route=$(ip route show default dev "$iface" 2>/dev/null | head -1)
+    fi
+
+    # 从原策略路由表删除该接口的默认路由
+    if [ -n "$other_table" ]; then
+        ip route del default dev "$iface" table "$other_table" 2>/dev/null
+    fi
+    ip route del default dev "$iface" 2>/dev/null
+
+    # 在主表添加最高优先级路由，让 curl 走该接口
+    ip route add default via "$gateway" dev "$iface" metric 1 2>/dev/null
+
+    # 强制认证
+    do_login force
+
+    # 恢复：删除临时路由
+    ip route del default via "$gateway" dev "$iface" metric 1 2>/dev/null
+
+    # 恢复原策略路由表路由
+    if [ -n "$orig_route" ]; then
+        local restore_route
+        restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
+        if [ -n "$other_table" ]; then
+            if ! ip route add $restore_route table "$other_table" 2>/dev/null; then
+                print_warn "恢复 $iface 路由到 table $other_table 失败: $restore_route"
+            fi
+        else
+            if ! ip route add $restore_route 2>/dev/null; then
+                print_warn "恢复 $iface 路由失败: $restore_route"
+            fi
+        fi
+    else
+        print_warn "$iface 原路由信息为空，跳过恢复"
+    fi
 }
 
 #================================================================
@@ -434,57 +565,11 @@ do_login() {
         # 认证其他WLAN客户端（仅在顶层调用执行，避免递归循环）
         if [ -z "${AUTH_DONE:-}" ]; then
             export AUTH_DONE="1"
-            local default_iface gateway
+            local default_iface
             default_iface=$(ip route show default | grep '^default' | awk '{print $5}' | head -1)
-            gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
             for other in $(detect_wlan_clients); do
-                if [ "$other" != "$default_iface" ] && [ -n "$gateway" ]; then
-                    print_info "从 $other 发起认证..."
-
-                    # 查找该接口所在的策略路由表（mwan3 将路由放在独立表中）
-                    local other_table
-                    other_table=$(find_route_table "$other")
-
-                    # 备份原路由信息
-                    local orig_route=""
-                    if [ -n "$other_table" ]; then
-                        orig_route=$(ip route show table "$other_table" default dev "$other" 2>/dev/null | head -1)
-                    else
-                        orig_route=$(ip route show default dev "$other" 2>/dev/null | head -1)
-                    fi
-
-                    # 从原策略路由表删除该接口的默认路由
-                    if [ -n "$other_table" ]; then
-                        ip route del default dev "$other" table "$other_table" 2>/dev/null
-                    fi
-                    ip route del default dev "$other" 2>/dev/null
-
-                    # 在主表添加最高优先级路由，让 curl 走该接口
-                    ip route add default via "$gateway" dev "$other" metric 1 2>/dev/null
-
-                    # 强制认证（必须传 force，否则 check_online 返回在线会跳过）
-                    do_login force
-
-                    # 恢复：删除临时路由
-                    ip route del default via "$gateway" dev "$other" metric 1 2>/dev/null
-
-                    # 恢复原策略路由表路由
-                    if [ -n "$orig_route" ]; then
-                        # 去掉可能存在的 "table N" 后缀，用 ip route add 恢复
-                        local restore_route
-                        restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
-                        if [ -n "$other_table" ]; then
-                            if ! ip route add $restore_route table "$other_table" 2>/dev/null; then
-                                print_warn "恢复 $other 路由到 table $other_table 失败: $restore_route"
-                            fi
-                        else
-                            if ! ip route add $restore_route 2>/dev/null; then
-                                print_warn "恢复 $other 路由失败: $restore_route"
-                            fi
-                        fi
-                    else
-                        print_warn "$other 原路由信息为空，跳过恢复"
-                    fi
+                if [ "$other" != "$default_iface" ]; then
+                    switch_route_and_login "$other"
                 fi
             done
             unset AUTH_DONE
@@ -515,6 +600,14 @@ do_keepalive() {
     print_info "qhulogin 保活模式启动"
     print_info "用户: ${USERNAME}  运营商: $(get_service_name "${SERVICE:-campus}")"
     print_info "检测间隔: ${PING_INTERVAL:-30}s"
+    if [ -n "${FORCE_RELOGIN_AT:-}" ]; then
+        print_info "定时重连: ${FORCE_RELOGIN_AT}"
+    fi
+    local wan_ifaces
+    wan_ifaces="$(detect_wlan_clients)"
+    if [ -n "$wan_ifaces" ]; then
+        print_info "WAN接口: $(echo $wan_ifaces | tr '\n' ' ')"
+    fi
 
     # 写入PID
     echo $$ > "$PID_FILE"
@@ -541,36 +634,59 @@ do_keepalive() {
 
     # 保活循环
     local interval="${PING_INTERVAL:-30}"
+    local relogin_date_file="/tmp/qhulogin_relogin_date"
     while true; do
         sleep "$interval"
 
-        # 用HTTP检测认证状态（检查所有WLAN客户端）
-        if check_all_online; then
+        # 定时强制重连（每天指定时间触发一次）
+        if [ -n "${FORCE_RELOGIN_AT:-}" ]; then
+            local now_date now_time last_date
+            now_date=$(date '+%Y-%m-%d')
+            now_time=$(date '+%H:%M')
+            last_date=$(cat "$relogin_date_file" 2>/dev/null)
+            if [ "$now_time" = "$FORCE_RELOGIN_AT" ] && [ "$now_date" != "$last_date" ]; then
+                print_info "定时强制重连 ($FORCE_RELOGIN_AT)"
+                log_msg "KEEPALIVE" "定时强制重连"
+                do_login force
+                echo "$now_date" > "$relogin_date_file"
+                continue
+            fi
+        fi
+
+        # 整体检测：全部掉线则重新认证
+        if ! check_all_online; then
+            print_warn "认证掉线或网络断开，尝试重新认证..."
+            log_msg "KEEPALIVE" "检测到掉线，重新认证"
+
+            # 重新认证，带退避重试
+            local reconnect=0
+            local backoff=10
+            while true; do
+                do_login
+                local ret=$?
+                if [ $ret -eq 0 ]; then
+                    break
+                fi
+                reconnect=$((reconnect + 1))
+                if [ $ret -eq 2 ]; then
+                    backoff=120
+                    print_warn "多设备在线冲突，${backoff}秒后重试 (第${reconnect}次)"
+                else
+                    backoff=10
+                    print_warn "重连失败，${backoff}秒后重试 (第${reconnect}次)"
+                fi
+                sleep "$backoff"
+            done
             continue
         fi
 
-        print_warn "认证掉线或网络断开，尝试重新认证..."
-        log_msg "KEEPALIVE" "检测到掉线，重新认证"
-
-        # 重新认证，带退避重试
-        local reconnect=0
-        local backoff=10
-        while true; do
-            do_login
-            local ret=$?
-            if [ $ret -eq 0 ]; then
-                break
+        # 逐接口检测：整体在线但个别接口可能未认证
+        for iface in $(detect_wlan_clients); do
+            if ! check_iface_online "$iface"; then
+                print_warn "$iface 未认证，发起认证..."
+                log_msg "KEEPALIVE" "$iface 未认证，发起认证"
+                switch_route_and_login "$iface"
             fi
-            reconnect=$((reconnect + 1))
-            # "在线上限"错误(ret=2)增加退避，避免疯狂重试
-            if [ $ret -eq 2 ]; then
-                backoff=120
-                print_warn "多设备在线冲突，${backoff}秒后重试 (第${reconnect}次)"
-            else
-                backoff=10
-                print_warn "重连失败，${backoff}秒后重试 (第${reconnect}次)"
-            fi
-            sleep "$backoff"
         done
     done
 }
@@ -701,14 +817,27 @@ do_config() {
         *) SERVICE="${SERVICE:-campus}" ;;
     esac
 
+    # WAN接口
+    echo ""
+    printf "  WAN接口(空格分隔,留空自动检测) [${WAN_INTERFACES:-}]: "
+    read -r input
+    WAN_INTERFACES="${input:-${WAN_INTERFACES:-}}"
+
+    # 定时重连
+    printf "  定时重连(HH:MM,留空禁用) [${FORCE_RELOGIN_AT:-}]: "
+    read -r input
+    FORCE_RELOGIN_AT="${input:-${FORCE_RELOGIN_AT:-}}"
+
     echo ""
     save_config
 
     echo -e ""
     print_info "配置摘要:"
-    echo -e "  用户名: ${USERNAME}"
-    echo -e "  密码:   ****"
-    echo -e "  运营商: $(get_service_name "$SERVICE")"
+    echo -e "  用户名:   ${USERNAME}"
+    echo -e "  密码:     ****"
+    echo -e "  运营商:   $(get_service_name "$SERVICE")"
+    echo -e "  WAN接口:  ${WAN_INTERFACES:-自动检测}"
+    echo -e "  定时重连: ${FORCE_RELOGIN_AT:-禁用}"
 }
 
 #================================================================
