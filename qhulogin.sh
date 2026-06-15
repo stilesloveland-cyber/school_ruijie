@@ -141,6 +141,39 @@ get_service_name() {
 #================================================================
 # 网络检测
 #================================================================
+# 发现 ePortal 服务器地址（优先缓存，否则通过 302 重定向探测）
+# 未认证时，访问任何 HTTP URL 会被 302 重定向到 ePortal，从中提取主机地址
+discover_eportal_host() {
+    # 优先使用缓存
+    if [ -f "$CACHE_FILE" ]; then
+        local cached_url
+        cached_url=$(cat "$CACHE_FILE" 2>/dev/null)
+        if [ -n "$cached_url" ]; then
+            # 从缓存的 login_page_url 提取 host:port (如 210.27.177.172 或 10.x.x.x:8080)
+            echo "$cached_url" | sed -n 's|.*://\([^/]*\).*|\1|p' | head -1
+            return
+        fi
+    fi
+
+    # 通过 su nobody 访问 HTTP URL，捕获 302 重定向的 Location 头
+    local location=""
+    if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
+        location=$(su -s /bin/sh nobody -c "curl -s -I -m 3 -L -o /dev/null -w '%{redirect_url}' http://www.google.cn/generate_204" 2>/dev/null)
+    fi
+
+    if [ -z "$location" ]; then
+        # 备选：用 run_curl 直接访问，看响应体中的重定向
+        local resp
+        resp=$(run_curl -s -m 3 "http://www.google.cn/generate_204" 2>/dev/null)
+        location=$(echo "$resp" | grep -oE "href='[^']+" | head -1 | sed "s/href='//")
+        [ -z "$location" ] && location=$(echo "$resp" | grep -oE 'href="[^"]+' | head -1 | sed 's/href="//')
+    fi
+
+    if [ -n "$location" ]; then
+        echo "$location" | sed -n 's|.*://\([^/]*\).*|\1|p' | head -1
+    fi
+}
+
 # 查找接口所在的策略路由表号（mwan3 将路由放在独立表中）
 find_route_table() {
     local iface="$1"
@@ -160,46 +193,36 @@ EOF
 }
 
 check_online() {
-    # 获取网关（优先默认路由，失败则尝试常见校园网网关）
-    local gateway
-    gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
-    
-    # 如果默认路由网关不是 10.x.x.x 网段，尝试常见校园网网关
-    if [ -z "$gateway" ] || ! echo "$gateway" | grep -qE '^10\.'; then
-        # 尝试常见校园网网关地址
-        local common_gateways="10.160.0.1 10.0.0.1 10.10.0.1 192.168.1.1"
-        for gw in $common_gateways; do
-            # 测试是否能 ping 通
-            if ping -c 1 -W 1 "$gw" 2>/dev/null | grep -q 'bytes from'; then
-                gateway="$gw"
-                break
-            fi
-        done
-    fi
-    
-    if [ -n "$gateway" ] && [ -n "${USERNAME:-}" ]; then
-        for iface in $(detect_wlan_clients); do
-            local user_info
-            if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
-                user_info=$(su -s /bin/sh nobody -c "curl --interface $iface -s -m 3 -d \"userId=${USERNAME}\" http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
-            else
-                user_info=$(curl -s -m 3 -d "userId=${USERNAME}" \
-                    "http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
-            fi
-            if echo "$user_info" | grep -qE '"userIndex"\s*:\s*".+"' 2>/dev/null; then
-                return 0
-            fi
-        done
+    # 方案1：通过 ePortal getOnlineUserInfo 查询（最可靠，不受 Clash 影响）
+    # 先从缓存或 302 重定向发现 ePortal 服务器地址
+    if [ -n "${USERNAME:-}" ]; then
+        local eportal_host
+        eportal_host=$(discover_eportal_host)
+        if [ -n "$eportal_host" ]; then
+            for iface in $(detect_wlan_clients); do
+                local user_info
+                if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
+                    user_info=$(su -s /bin/sh nobody -c "curl --interface $iface -s -m 3 -d \"userId=${USERNAME}\" http://${eportal_host}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
+                else
+                    user_info=$(run_curl -s -m 3 -d "userId=${USERNAME}" \
+                        "http://${eportal_host}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
+                fi
+                if echo "$user_info" | grep -qE '"userIndex"\s*:\s*".+"' 2>/dev/null; then
+                    return 0
+                fi
+            done
+        fi
     fi
 
+    # 方案2：su nobody + generate_204（绕过 Clash，检测真实连通性）
     local code
     if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
         code=$(su -s /bin/sh nobody -c "curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204" 2>/dev/null)
-    else
-        code=$(curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
+        [ "$code" = "204" ] && return 0
+        return 1
     fi
-    [ "$code" = "204" ] && return 0
 
+    # 无 su/nobody 时无法绕过 Clash，generate_204 不可信，直接返回离线
     return 1
 }
 
@@ -289,12 +312,12 @@ do_logout() {
         login_page_url=$(cat "$CACHE_FILE" 2>/dev/null)
     fi
 
-    # 尝试通过网关获取
+    # 尝试通过 ePortal 服务器发现
     if [ -z "$login_page_url" ]; then
-        local gateway=""
-        gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
-        if [ -n "$gateway" ]; then
-            login_page_url="http://${gateway}/eportal/index.jsp"
+        local eportal_host
+        eportal_host=$(discover_eportal_host)
+        if [ -n "$eportal_host" ]; then
+            login_page_url="http://${eportal_host}/eportal/index.jsp"
         fi
     fi
 
@@ -339,47 +362,44 @@ do_logout() {
 }
 
 #================================================================
-# curl 包装器：支持 su nobody --interface 绕过 Clash（不修改路由表）
-# 当 LOGIN_INTERFACE 设置时，用 su nobody --interface $LOGIN_INTERFACE
-# 不修改路由表，完全依赖 --interface 绑定接口
+# curl 包装器：始终通过 su nobody 绕过 Clash
+# 当 LOGIN_INTERFACE 设置时，额外用 --interface 绑定接口
 #================================================================
 run_curl() {
-    # 如果没有 LOGIN_INTERFACE，直接用普通 curl
-    if [ -z "${LOGIN_INTERFACE:-}" ]; then
-        curl "$@" 2>/dev/null
-        return
-    fi
-    
     # 检查 su 和 nobody 是否可用
     if ! command -v su >/dev/null 2>&1 || ! id nobody >/dev/null 2>&1; then
         # 降级：没有 su/nobody，直接用普通 curl（可能被 Clash 欺骗）
         curl "$@" 2>/dev/null
         return
     fi
-    
-    # 仅用 su nobody + --interface（绕过Clash且绑定接口，不修改路由表）
+
+    # su nobody 绕过 Clash；有 LOGIN_INTERFACE 时额外绑定接口
     local tmp_script="/tmp/_qhulogin_curl_$$"
     {
         echo '#!/bin/sh'
-        printf "exec curl --interface '%s'" "$LOGIN_INTERFACE"
+        if [ -n "${LOGIN_INTERFACE:-}" ]; then
+            printf "exec curl --interface '%s'" "$LOGIN_INTERFACE"
+        else
+            printf "exec curl"
+        fi
         local _arg
         for _arg in "$@"; do
             printf " '%s'" "$(echo "$_arg" | sed "s/'/'\\\\''/g")"
         done
         echo
     } > "$tmp_script"
-    chmod +r "$tmp_script"
+    chmod 600 "$tmp_script"
     local result
     result=$(su -s /bin/sh nobody -c "$tmp_script" 2>/dev/null)
     rm -f "$tmp_script"
-    
+
     # 如果有结果，直接返回
     if [ -n "$result" ]; then
         echo "$result"
         return
     fi
-    
-    # 降级：--interface 失败，直接用普通 curl（走默认路由）
+
+    # 降级：su nobody 失败，直接用普通 curl（走默认路由）
     curl "$@" 2>/dev/null
 }
 
@@ -458,27 +478,15 @@ do_login() {
             login_page_url=$(cat "$CACHE_FILE" 2>/dev/null)
             print_info "使用缓存的认证URL"
         else
-            # 2. 通过网关IP直接访问ePortal
-            local gateway=""
-            gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
-            
-            # 如果默认路由网关不是 10.x.x.x 网段，尝试常见校园网网关
-            if [ -z "$gateway" ] || ! echo "$gateway" | grep -qE '^10\.'; then
-                local common_gateways="10.160.0.1 10.0.0.1 10.10.0.1 192.168.1.1"
-                for gw in $common_gateways; do
-                    if ping -c 1 -W 1 "$gw" 2>/dev/null | grep -q 'bytes from'; then
-                        gateway="$gw"
-                        break
-                    fi
-                done
-            fi
-            
-            if [ -n "$gateway" ]; then
-                print_info "尝试通过网关 $gateway 获取认证页..."
+            # 2. 通过 302 重定向发现 ePortal 服务器，再获取认证页
+            local eportal_host
+            eportal_host=$(discover_eportal_host)
+            if [ -n "$eportal_host" ]; then
+                print_info "尝试通过 ePortal 服务器 $eportal_host 获取认证页..."
                 local gw_response=""
-                gw_response=$(run_curl -s -L -m 3 "http://${gateway}/eportal/index.jsp")
+                gw_response=$(run_curl -s -L -m 3 "http://${eportal_host}/eportal/index.jsp")
                 if [ -z "$gw_response" ]; then
-                    gw_response=$(run_curl -s -L -m 3 "http://${gateway}")
+                    gw_response=$(run_curl -s -L -m 3 "http://${eportal_host}")
                 fi
                 if [ -n "$gw_response" ]; then
                     login_page_url=$(echo "$gw_response" | grep -oE "href='[^']+" | head -1 | sed "s/href='//")
