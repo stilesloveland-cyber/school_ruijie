@@ -273,7 +273,18 @@ do_login() {
     local ip_tag=""
     if [ -n "$bind_ip" ]; then
         curl_cmd="curl --bind-address $bind_ip"
-        ip_tag=" [IP:$bind_ip]"
+        local iface_name
+        iface_name=$(ip addr show 2>/dev/null | grep "inet ${bind_ip}/" | awk '{print $NF}' | head -1)
+        ip_tag=" [${iface_name:-unknown}:$bind_ip]"
+    else
+        # 默认路由的网卡名
+        local default_iface
+        default_iface=$(ip route show default 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
+        local default_ip
+        default_ip=$(ip route get 8.8.8.8 2>/dev/null | head -1 | awk '{print $7}')
+        if [ -n "$default_iface" ] && [ -n "$default_ip" ]; then
+            ip_tag=" [$default_iface:$default_ip]"
+        fi
     fi
 
     # 非强制模式：已在线则跳过
@@ -860,23 +871,27 @@ show_menu() {
         echo -e "${BOLD}     GHU 校园网登录管理${NC}"
         echo -e "${BOLD}========================================${NC}"
 
-        # 显示状态（读取缓存，不阻塞菜单）
+        # 显示状态（读取缓存，不阻塞菜单。缓存过期时后台刷新但不显示"检测中"）
         local status_file="/tmp/qhulogin_status"
         local status="${GRAY}● 检测中...${NC}"
 
-        # 后台检测（不阻塞）
-        if [ ! -f "$status_file" ] || [ "$(($(date +%s) - $(stat -c %Y "$status_file" 2>/dev/null || echo 0)))" -gt 10 ]; then
+        # 读取已有缓存
+        local cached_status=""
+        if [ -f "$status_file" ]; then
+            cached_status=$(cat "$status_file" 2>/dev/null)
+        fi
+
+        # 无缓存或过期时后台刷新
+        if [ -z "$cached_status" ] || [ "$(($(date +%s) - $(stat -c %Y "$status_file" 2>/dev/null || echo 0)))" -gt 10 ]; then
             (check_all_online 2>/dev/null && echo "ONLINE" || echo "OFFLINE") > "$status_file" &
         fi
 
-        # 读取缓存
-        if [ -f "$status_file" ]; then
-            if grep -q "ONLINE" "$status_file" 2>/dev/null; then
-                status="${GREEN}● 在线${NC}"
-            elif grep -q "OFFLINE" "$status_file" 2>/dev/null; then
-                status="${RED}● 离线${NC}"
-            fi
-        fi
+        # 显示缓存值（不显示"检测中"）
+        case "$cached_status" in
+            ONLINE)  status="${GREEN}● 在线${NC}" ;;
+            OFFLINE) status="${RED}● 离线${NC}" ;;
+            *)       status="${GRAY}● 检测中...${NC}" ;;
+        esac
         echo -e "  状态: $status"
 
         echo ""
