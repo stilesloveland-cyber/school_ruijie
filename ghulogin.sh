@@ -1,7 +1,7 @@
 #!/bin/sh
 #================================================================
 # qhulogin - 锐捷ePortal自动认证工具
-# Version: 1.3.3
+# Version: 1.4.0
 # 功能：校园网自动登录 + 保活重连 + 命令行管理
 # 平台：iStoreOS/OpenWrt (斐讯N1)
 # 用法：qhulogin [命令]
@@ -36,9 +36,8 @@ readonly CACHE_FILE="${CONF_DIR}/.login_cache"
 # 多网卡检测（只检测Client模式无线网卡）
 #================================================================
 detect_wlan_clients() {
-    # 从路由表获取所有有默认路由的无线网卡
-    # 不依赖 iwinfo，更可靠
-    ip route show default 2>/dev/null | \
+    # 从主路由表和 mwan3 策略路由表获取所有有默认路由的接口
+    (ip route show default 2>/dev/null; ip route show table all 2>/dev/null | grep '^default') | \
         awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | \
         sort -u
 }
@@ -123,29 +122,38 @@ get_service_name() {
 }
 
 #================================================================
-# 网络检测（快速版：先试一个URL，1s超时）
+# 网络检测
 #================================================================
 check_online() {
-    local iface="${1:-}"
-    local curl_cmd="curl"
-    if [ -n "$iface" ]; then
-        curl_cmd="curl --interface $iface"
-    fi
-
-    # 快速检测：单个URL，2s超时
+    # 方法1: generate_204 检测（可能被 Clash 代理拦截）
     local code
-    code=$($curl_cmd -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
+    code=$(curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
     [ "$code" = "204" ] && return 0
 
-    # 备选检测（罕见失败时再试）
-    code=$($curl_cmd -s -I -m 2 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
+    # 方法2: 备选检测
+    code=$(curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
     [ "$code" = "204" ] && return 0
+
+    # 方法3: 直连 ePortal API 查询在线状态（不走 Clash 代理，10.x.x.x 不会被劫持）
+    local gateway
+    gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+    if [ -n "$gateway" ]; then
+        local username="${USERNAME:-}"
+        if [ -n "$username" ]; then
+            local user_info
+            user_info=$(curl -s -m 3 -d "userId=${username}" \
+                "http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
+            if echo "$user_info" | grep -qE '"userIndex"\s*:\s*".+"' 2>/dev/null; then
+                return 0
+            fi
+        fi
+    fi
 
     return 1
 }
 
-# 检测所有WLAN客户端（串行，但每个只等2s）
 check_all_online() {
+    load_config 2>/dev/null
     check_online
 }
 
