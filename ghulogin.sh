@@ -146,18 +146,7 @@ check_online() {
 
 # 检测所有WLAN客户端（串行，但每个只等2s）
 check_all_online() {
-    # 默认路由最可能在线，优先
-    check_online && return 0
-
-    # 逐个检查其他WLAN客户端（最多等 2s × N）
-    local found=1
-    for iface in $(detect_wlan_clients); do
-        if check_online "$iface"; then
-            found=0
-            break
-        fi
-    done
-    return $found
+    check_online
 }
 
 #================================================================
@@ -252,7 +241,6 @@ do_logout() {
 #================================================================
 do_login() {
     local force="${1:-}"
-    local bind_iface="${2:-}"
 
     # 加载配置
     load_config 2>/dev/null
@@ -263,22 +251,14 @@ do_login() {
         return 1
     fi
 
-    # 构造curl命令（可选绑定来源接口，用于多网卡分别认证）
-    local curl_cmd="curl"
-    local ip_tag=""
-    if [ -n "$bind_iface" ]; then
-        curl_cmd="curl --interface $bind_iface"
-    fi
-
-    # 获取本机IP用于日志显示（从默认路由或指定接口）
+    # 获取本机IP用于日志显示
+    local my_iface
+    my_iface=$(ip route show default 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
     local my_ip=""
-    local my_iface="$bind_iface"
-    if [ -z "$my_iface" ]; then
-        my_iface=$(ip route show default 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
-    fi
     if [ -n "$my_iface" ]; then
         my_ip=$(ip addr show dev "$my_iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
     fi
+    local ip_tag=""
     if [ -n "$my_iface" ] && [ -n "$my_ip" ]; then
         ip_tag=" [$my_iface:$my_ip]"
     fi
@@ -295,7 +275,7 @@ do_login() {
 
     # 获取认证页面（3s超时，离线时快速返回）
     local response
-    response=$($curl_cmd -s -L -m 3 "http://www.google.cn/generate_204" 2>/dev/null)
+    response=$(curl -s -L -m 3 "http://www.google.cn/generate_204" 2>/dev/null)
 
     # 提取登录页URL
     local login_page_url=""
@@ -333,9 +313,9 @@ do_login() {
             if [ -n "$gateway" ]; then
                 print_info "尝试通过网关 $gateway 获取认证页..."
                 local gw_response=""
-                gw_response=$($curl_cmd -s -L -m 3 "http://${gateway}/eportal/index.jsp" 2>/dev/null)
+                gw_response=$(curl -s -L -m 3 "http://${gateway}/eportal/index.jsp" 2>/dev/null)
                 if [ -z "$gw_response" ]; then
-                    gw_response=$($curl_cmd -s -L -m 3 "http://${gateway}" 2>/dev/null)
+                    gw_response=$(curl -s -L -m 3 "http://${gateway}" 2>/dev/null)
                 fi
                 if [ -n "$gw_response" ]; then
                     login_page_url=$(echo "$gw_response" | grep -oE "href='[^']+" | head -1 | sed "s/href='//")
@@ -374,7 +354,7 @@ do_login() {
 
     # 获取登录页HTML，提取RSA公钥
     local login_html rsa_key encrypted_password password_encrypt
-    login_html=$($curl_cmd -s -m 5 "$login_page_url" 2>/dev/null)
+    login_html=$(curl -s -m 5 "$login_page_url" 2>/dev/null)
     rsa_key=$(echo "$login_html" | grep -oE 'publicKey\s*=\s*["\x27][A-Za-z0-9+/=]{100,}["\x27]' | sed "s/.*=['\"]//;s/['\"]$//")
 
     # 加密密码
@@ -401,7 +381,7 @@ do_login() {
     # 发送认证请求
     print_info "发送认证请求..."
     local result
-    result=$($curl_cmd -s -m 15 \
+    result=$(curl -s -m 15 \
         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36" \
         -e "$login_page_url" \
         -H "Accept: */*" \
@@ -424,16 +404,27 @@ do_login() {
         print_success "认证成功!${ip_tag}"
         log_msg "LOGIN" "用户 ${USERNAME}${ip_tag} 认证成功"
 
-        # 默认路由认证成功后，用 --interface 认证其他WLAN客户端
-        if [ -z "$bind_iface" ]; then
-            local default_iface
-            default_iface=$(ip route show default 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
+        # 认证其他WLAN客户端（仅在顶层调用执行，避免递归循环）
+        if [ -z "${AUTH_DONE:-}" ]; then
+            export AUTH_DONE="1"
+            local default_iface gateway
+            default_iface=$(ip route show default | grep '^default' | awk '{print $5}' | head -1)
+            gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
             for other in $(detect_wlan_clients); do
-                if [ "$other" != "$default_iface" ]; then
+                if [ "$other" != "$default_iface" ] && [ -n "$gateway" ]; then
                     print_info "从 $other 发起认证..."
-                    do_login "" "$other"
+                    # 记录原metric，切换为最高优先级
+                    local orig_metric
+                    orig_metric=$(ip route show default | grep "dev $other" | awk '{print $NF}')
+                    ip route replace default via "$gateway" dev "$other" metric 1 2>/dev/null
+                    do_login
+                    # 恢复原metric
+                    if [ -n "$orig_metric" ]; then
+                        ip route replace default via "$gateway" dev "$other" metric "$orig_metric" 2>/dev/null
+                    fi
                 fi
             done
+            unset AUTH_DONE
         fi
         return 0
     else
