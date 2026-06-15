@@ -31,36 +31,16 @@ readonly LOG_FILE="/var/log/qhulogin.log"
 readonly PID_FILE="/var/run/qhulogin.pid"
 readonly INIT_SCRIPT="/etc/init.d/qhulogin"
 readonly CACHE_FILE="${CONF_DIR}/.login_cache"
-readonly NIC_CACHE="${CONF_DIR}/.nic_cache"
 
 #================================================================
 # 多网卡检测（只检测Client模式无线网卡）
 #================================================================
 detect_wlan_clients() {
-    # 优先使用缓存（60秒内有效，避免菜单反复调用）
-    if [ -f "$NIC_CACHE" ]; then
-        local mtime age
-        mtime=$(stat -c %Y "$NIC_CACHE" 2>/dev/null || echo 0)
-        age=$(( $(date +%s) - mtime ))
-        if [ "$age" -lt 60 ] 2>/dev/null; then
-            cat "$NIC_CACHE"
-            return
-        fi
-    fi
-
-    # 通过 iwinfo 检测所有 Client 模式的无线网卡
-    local clients
-    if command -v iwinfo >/dev/null 2>&1; then
-        clients=$(iwinfo 2>/dev/null | awk '
-            /^\S/ && /ESSID:/ {iface=$1}
-            /Mode: Client/ {print iface}
-        ' | sort -u)
-    fi
-
-    if [ -n "$clients" ]; then
-        echo "$clients" > "$NIC_CACHE"
-        echo "$clients"
-    fi
+    # 从路由表获取所有有默认路由的无线网卡
+    # 不依赖 iwinfo，更可靠
+    ip route show default 2>/dev/null | \
+        awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | \
+        sort -u
 }
 
 #================================================================
