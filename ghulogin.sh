@@ -125,16 +125,7 @@ get_service_name() {
 # 网络检测
 #================================================================
 check_online() {
-    # 方法1: generate_204 检测（可能被 Clash 代理拦截）
-    local code
-    code=$(curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
-    [ "$code" = "204" ] && return 0
-
-    # 方法2: 备选检测
-    code=$(curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
-    [ "$code" = "204" ] && return 0
-
-    # 方法3: 直连 ePortal API 查询在线状态（不走 Clash 代理，10.x.x.x 不会被劫持）
+    # 直连 ePortal API 查询在线状态（不走 Clash 代理，10.x.x.x 不会被劫持）
     local gateway
     gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
     if [ -n "$gateway" ]; then
@@ -147,6 +138,13 @@ check_online() {
                 return 0
             fi
         fi
+    fi
+
+    # 备选：未配置账号时用 generate_204 快速检测（可能被 Clash 干扰）
+    if [ -z "${USERNAME:-}" ]; then
+        local code
+        code=$(curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
+        [ "$code" = "204" ] && return 0
     fi
 
     return 1
