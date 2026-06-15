@@ -261,58 +261,17 @@ check_iface_online() {
 #================================================================
 switch_route_and_login() {
     local iface="$1"
-    local gateway
-    gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
-    if [ -z "$gateway" ]; then
-        print_error "无法获取网关地址"
-        return 1
-    fi
 
     print_info "从 $iface 发起认证..."
 
-    # 查找该接口所在的策略路由表
-    local other_table
-    other_table=$(find_route_table "$iface")
-
-    # 备份原路由信息
-    local orig_route=""
-    if [ -n "$other_table" ]; then
-        orig_route=$(ip route show table "$other_table" default dev "$iface" 2>/dev/null | head -1)
-    else
-        orig_route=$(ip route show default dev "$iface" 2>/dev/null | head -1)
-    fi
-
-    # 从原策略路由表删除该接口的默认路由
-    if [ -n "$other_table" ]; then
-        ip route del default dev "$iface" table "$other_table" 2>/dev/null
-    fi
-    ip route del default dev "$iface" 2>/dev/null
-
-    # 在主表添加最高优先级路由，让 curl 走该接口
-    ip route add default via "$gateway" dev "$iface" metric 1 2>/dev/null
+    # 设置 LOGIN_INTERFACE，让 run_curl 用 su nobody --interface $iface 绕过 Clash
+    export LOGIN_INTERFACE="$iface"
 
     # 强制认证
     do_login force
 
-    # 恢复：删除临时路由
-    ip route del default via "$gateway" dev "$iface" metric 1 2>/dev/null
-
-    # 恢复原策略路由表路由
-    if [ -n "$orig_route" ]; then
-        local restore_route
-        restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
-        if [ -n "$other_table" ]; then
-            if ! ip route add $restore_route table "$other_table" 2>/dev/null; then
-                print_warn "恢复 $iface 路由到 table $other_table 失败: $restore_route"
-            fi
-        else
-            if ! ip route add $restore_route 2>/dev/null; then
-                print_warn "恢复 $iface 路由失败: $restore_route"
-            fi
-        fi
-    else
-        print_warn "$iface 原路由信息为空，跳过恢复"
-    fi
+    # 清除接口绑定
+    unset LOGIN_INTERFACE
 }
 
 #================================================================
@@ -403,6 +362,19 @@ do_logout() {
 }
 
 #================================================================
+# curl 包装器：支持 su nobody --interface 绕过 Clash
+# 当 LOGIN_INTERFACE 设置时，用 su nobody --interface $LOGIN_INTERFACE
+# 否则直接用 curl
+#================================================================
+run_curl() {
+    if [ -n "${LOGIN_INTERFACE:-}" ] && command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
+        su -s /bin/sh nobody -c "curl --interface $LOGIN_INTERFACE $*" 2>/dev/null
+    else
+        curl "$@" 2>/dev/null
+    fi
+}
+
+#================================================================
 # 认证核心
 #================================================================
 do_login() {
@@ -419,7 +391,11 @@ do_login() {
 
     # 获取本机IP用于日志显示
     local my_iface
-    my_iface=$(ip route show default 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
+    if [ -n "${LOGIN_INTERFACE:-}" ]; then
+        my_iface="$LOGIN_INTERFACE"
+    else
+        my_iface=$(ip route show default 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
+    fi
     local my_ip=""
     if [ -n "$my_iface" ]; then
         my_ip=$(ip addr show dev "$my_iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
@@ -441,7 +417,7 @@ do_login() {
 
     # 获取认证页面（3s超时，离线时快速返回）
     local response
-    response=$(curl -s -L -m 3 "http://www.google.cn/generate_204" 2>/dev/null)
+    response=$(run_curl -s -L -m 3 "http://www.google.cn/generate_204")
 
     # 提取登录页URL
     local login_page_url=""
@@ -479,9 +455,9 @@ do_login() {
             if [ -n "$gateway" ]; then
                 print_info "尝试通过网关 $gateway 获取认证页..."
                 local gw_response=""
-                gw_response=$(curl -s -L -m 3 "http://${gateway}/eportal/index.jsp" 2>/dev/null)
+                gw_response=$(run_curl -s -L -m 3 "http://${gateway}/eportal/index.jsp")
                 if [ -z "$gw_response" ]; then
-                    gw_response=$(curl -s -L -m 3 "http://${gateway}" 2>/dev/null)
+                    gw_response=$(run_curl -s -L -m 3 "http://${gateway}")
                 fi
                 if [ -n "$gw_response" ]; then
                     login_page_url=$(echo "$gw_response" | grep -oE "href='[^']+" | head -1 | sed "s/href='//")
@@ -520,7 +496,7 @@ do_login() {
 
     # 获取登录页HTML，提取RSA公钥
     local login_html rsa_key encrypted_password password_encrypt
-    login_html=$(curl -s -m 5 "$login_page_url" 2>/dev/null)
+    login_html=$(run_curl -s -m 5 "$login_page_url")
     rsa_key=$(echo "$login_html" | grep -oE 'publicKey\s*=\s*["\x27][A-Za-z0-9+/=]{100,}["\x27]' | sed "s/.*=['\"]//;s/['\"]$//")
 
     # 加密密码
@@ -547,13 +523,13 @@ do_login() {
     # 发送认证请求
     print_info "发送认证请求..."
     local result
-    result=$(curl -s -m 15 \
+    result=$(run_curl -s -m 15 \
         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36" \
         -e "$login_page_url" \
         -H "Accept: */*" \
         -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
         -d "userId=${USERNAME}&password=${encrypted_password}&service=${service_string}&queryString=${query_string}&operatorPwd=&operatorUserId=&validcode=&passwordEncrypt=${password_encrypt}" \
-        "$login_url" 2>/dev/null)
+        "$login_url")
 
     if [ -z "$result" ]; then
         print_error "认证请求无响应"
