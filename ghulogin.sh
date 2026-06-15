@@ -415,8 +415,21 @@ run_curl() {
             ip route add default via "$gateway" dev "$LOGIN_INTERFACE" metric 1 2>/dev/null
             
             # 执行curl（此时会走目标接口，用su nobody绕过Clash）
-            result=$(su -s /bin/sh nobody -c "curl $*" 2>/dev/null)
+            # 同样用临时脚本传递参数，避免空格断裂
+            local tmp_script2="/tmp/_qhulogin_curl2_$$"
+            {
+                echo '#!/bin/sh'
+                printf "exec curl"
+                local _arg
+                for _arg in "$@"; do
+                    printf " '%s'" "$(echo "$_arg" | sed "s/'/'\\\\''/g")"
+                done
+                echo
+            } > "$tmp_script2"
+            chmod +r "$tmp_script2"
+            result=$(su -s /bin/sh nobody -c "$tmp_script2" 2>/dev/null)
             exit_code=$?
+            rm -f "$tmp_script2"
             
             # 恢复路由
             ip route del default via "$gateway" dev "$LOGIN_INTERFACE" metric 1 2>/dev/null
