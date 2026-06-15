@@ -63,16 +63,6 @@ detect_wlan_clients() {
     fi
 }
 
-# _curl - 可选接口绑定的curl封装
-_curl() {
-    local iface="${CURL_IFACE:-}"
-    if [ -n "$iface" ] && [ "$iface" != "lo" ]; then
-        curl --interface "$iface" "$@"
-    else
-        curl "$@"
-    fi
-}
-
 #================================================================
 # 运营商映射
 #================================================================
@@ -159,7 +149,12 @@ check_online() {
     local iface="${1:-}"
     local curl_cmd="curl"
     if [ -n "$iface" ]; then
-        curl_cmd="curl --interface $iface"
+        # 尝试绑定接口IP（比 --interface 更可靠）
+        local ip
+        ip=$(ip addr show dev "$iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
+        if [ -n "$ip" ]; then
+            curl_cmd="curl --bind-address $ip"
+        fi
     fi
 
     # 快速检测：单个URL，2s超时
@@ -282,7 +277,7 @@ do_logout() {
 #================================================================
 do_login() {
     local force="${1:-}"
-    local iface="${2:-}"
+    local bind_ip="${2:-}"
 
     # 加载配置
     load_config 2>/dev/null
@@ -293,30 +288,23 @@ do_login() {
         return 1
     fi
 
-    # 按接口检测在线
+    # 构造curl命令（可选绑定来源IP，用于多网卡分别认证）
+    local curl_cmd="curl"
+    local ip_tag=""
+    if [ -n "$bind_ip" ]; then
+        curl_cmd="curl --bind-address $bind_ip"
+        ip_tag=" [IP:$bind_ip]"
+    fi
+
+    # 非强制模式：已在线则跳过
     if [ "$force" != "force" ]; then
-        if [ -n "$iface" ]; then
-            if check_online "$iface"; then
-                print_success "${iface} 已在线，无需认证"
-                return 0
-            fi
-        else
-            if check_all_online; then
-                print_success "已在线，无需认证"
-                return 0
-            fi
+        if check_all_online; then
+            print_success "已在线，无需认证"
+            return 0
         fi
     fi
 
-    # 构造 curl 命令（带接口绑定）
-    local curl_cmd="curl"
-    local iface_tag=""
-    if [ -n "$iface" ]; then
-        curl_cmd="curl --interface $iface"
-        iface_tag=" [$iface]"
-    fi
-
-    print_info "开始登录${iface_tag}..."
+    print_info "开始登录${ip_tag}..."
 
     # 获取认证页面（3s超时，离线时快速返回）
     local response
@@ -446,14 +434,19 @@ do_login() {
     fi
 
     if $login_ok; then
-        print_success "认证成功!${iface_tag}"
-        log_msg "LOGIN" "用户 ${USERNAME}${iface_tag} 认证成功"
+        print_success "认证成功!${ip_tag}"
+        log_msg "LOGIN" "用户 ${USERNAME}${ip_tag} 认证成功"
 
-        # 默认路由认证成功后，顺带认证其他WLAN客户端
-        if [ -z "$iface" ]; then
+        # 默认路由认证成功后，用 --bind-address 认证其他WLAN客户端
+        if [ -z "$bind_ip" ]; then
+            local my_ip
+            my_ip=$(ip -4 route get 8.8.8.8 2>/dev/null | head -1 | awk '{print $7}')
             for other in $(detect_wlan_clients); do
-                if echo "$other" | grep -q "wlan"; then
-                    do_login "" "$other"
+                local other_ip
+                other_ip=$(ip addr show dev "$other" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
+                if [ -n "$other_ip" ] && [ "$other_ip" != "$my_ip" ]; then
+                    print_info "从 $other ($other_ip) 发起认证..."
+                    do_login "" "$other_ip"
                 fi
             done
         fi
@@ -462,7 +455,7 @@ do_login() {
         # 检查是否"同时在线用户数量上限"
         if echo "$result" | grep -q '同时在线用户数量上限' 2>/dev/null; then
             print_error "认证失败: 账号在其他设备在线"
-            log_msg "LOGIN" "认证失败: 多设备在线上限${iface_tag}"
+            log_msg "LOGIN" "认证失败: 多设备在线上限${ip_tag}"
             return 2
         fi
         print_error "认证失败: $(echo "$result" | head -c 200)"
@@ -554,12 +547,15 @@ do_status() {
     # 在线状态
     if check_all_online; then
         echo -e "  网络状态: ${GREEN}● 在线${NC}"
-        # 显示各WLAN客户端状态
+        # 显示各WLAN客户端（通过路由表判断）
         for iface in $(detect_wlan_clients); do
-            if check_online "$iface"; then
-                echo -e "    ${iface}: ${GREEN}● 已认证${NC}"
+            # 检查该接口是否有默认路由
+            local has_route
+            has_route=$(ip route show default 2>/dev/null | grep -c "dev $iface")
+            if [ "$has_route" -gt 0 ]; then
+                echo -e "    ${iface}: ${GREEN}● 已接入${NC}"
             else
-                echo -e "    ${iface}: ${RED}● 离线${NC}"
+                echo -e "    ${iface}: ${GRAY}○ 备用${NC}"
             fi
         done
     else
