@@ -1,7 +1,7 @@
 #!/bin/sh
 #================================================================
 # qhulogin - 锐捷ePortal自动认证工具
-# Version: 1.3.0
+# Version: 1.2.0
 # 功能：校园网自动登录 + 保活重连 + 命令行管理
 # 平台：iStoreOS/OpenWrt (斐讯N1)
 # 用法：qhulogin [命令]
@@ -31,47 +31,6 @@ readonly LOG_FILE="/var/log/qhulogin.log"
 readonly PID_FILE="/var/run/qhulogin.pid"
 readonly INIT_SCRIPT="/etc/init.d/qhulogin"
 readonly CACHE_FILE="${CONF_DIR}/.login_cache"
-readonly NIC_CACHE="${CONF_DIR}/.nic_cache"
-
-#================================================================
-# 多网卡检测（只检测Client模式无线网卡）
-#================================================================
-detect_wlan_clients() {
-    # 优先使用缓存（60秒内有效，避免菜单反复调用）
-    if [ -f "$NIC_CACHE" ]; then
-        local mtime age
-        mtime=$(stat -c %Y "$NIC_CACHE" 2>/dev/null || echo 0)
-        age=$(( $(date +%s) - mtime ))
-        if [ "$age" -lt 60 ] 2>/dev/null; then
-            cat "$NIC_CACHE"
-            return
-        fi
-    fi
-
-    # 通过 iwinfo 检测所有 Client 模式的无线网卡
-    local clients
-    if command -v iwinfo >/dev/null 2>&1; then
-        clients=$(iwinfo 2>/dev/null | awk '
-            /^\S/ && /ESSID:/ {iface=$1}
-            /Mode: Client/ {print iface}
-        ' | sort -u)
-    fi
-
-    if [ -n "$clients" ]; then
-        echo "$clients" > "$NIC_CACHE"
-        echo "$clients"
-    fi
-}
-
-# _curl - 可选接口绑定的curl封装
-_curl() {
-    local iface="${CURL_IFACE:-}"
-    if [ -n "$iface" ] && [ "$iface" != "lo" ]; then
-        curl --interface "$iface" "$@"
-    else
-        curl "$@"
-    fi
-}
 
 #================================================================
 # 运营商映射
@@ -153,41 +112,19 @@ get_service_name() {
 }
 
 #================================================================
-# 网络检测（快速版：先试一个URL，1s超时）
+# 网络检测
 #================================================================
 check_online() {
-    local iface="${1:-}"
-    local curl_cmd="curl"
-    if [ -n "$iface" ]; then
-        curl_cmd="curl --interface $iface"
-    fi
-
-    # 快速检测：单个URL，2s超时
     local code
-    code=$($curl_cmd -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
-    [ "$code" = "204" ] && return 0
-
-    # 备选检测（罕见失败时再试）
-    code=$($curl_cmd -s -I -m 2 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
-    [ "$code" = "204" ] && return 0
-
+    code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
+    if [ "$code" = "204" ]; then
+        return 0
+    fi
+    code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
+    if [ "$code" = "204" ]; then
+        return 0
+    fi
     return 1
-}
-
-# 检测所有WLAN客户端（串行，但每个只等2s）
-check_all_online() {
-    # 默认路由最可能在线，优先
-    check_online && return 0
-
-    # 逐个检查其他WLAN客户端（最多等 2s × N）
-    local found=1
-    for iface in $(detect_wlan_clients); do
-        if check_online "$iface"; then
-            found=0
-            break
-        fi
-    done
-    return $found
 }
 
 #================================================================
@@ -282,7 +219,6 @@ do_logout() {
 #================================================================
 do_login() {
     local force="${1:-}"
-    local iface="${2:-}"
 
     # 加载配置
     load_config 2>/dev/null
@@ -293,34 +229,17 @@ do_login() {
         return 1
     fi
 
-    # 按接口检测在线
-    if [ "$force" != "force" ]; then
-        if [ -n "$iface" ]; then
-            if check_online "$iface"; then
-                print_success "${iface} 已在线，无需认证"
-                return 0
-            fi
-        else
-            if check_all_online; then
-                print_success "已在线，无需认证"
-                return 0
-            fi
-        fi
+    # 非强制模式：已在线则跳过
+    if [ "$force" != "force" ] && check_online; then
+        print_success "已在线，无需认证"
+        return 0
     fi
 
-    # 构造 curl 命令（带接口绑定）
-    local curl_cmd="curl"
-    local iface_tag=""
-    if [ -n "$iface" ]; then
-        curl_cmd="curl --interface $iface"
-        iface_tag=" [$iface]"
-    fi
+    print_info "开始登录..."
 
-    print_info "开始登录${iface_tag}..."
-
-    # 获取认证页面（3s超时，离线时快速返回）
+    # 获取认证页面
     local response
-    response=$($curl_cmd -s -L -m 3 "http://www.google.cn/generate_204" 2>/dev/null)
+    response=$(curl -s -L -m 10 "http://www.google.cn/generate_204" 2>/dev/null)
 
     # 提取登录页URL
     local login_page_url=""
@@ -358,9 +277,9 @@ do_login() {
             if [ -n "$gateway" ]; then
                 print_info "尝试通过网关 $gateway 获取认证页..."
                 local gw_response=""
-                gw_response=$($curl_cmd -s -L -m 3 "http://${gateway}/eportal/index.jsp" 2>/dev/null)
+                gw_response=$(curl -s -L -m 5 "http://${gateway}/eportal/index.jsp" 2>/dev/null)
                 if [ -z "$gw_response" ]; then
-                    gw_response=$($curl_cmd -s -L -m 3 "http://${gateway}" 2>/dev/null)
+                    gw_response=$(curl -s -L -m 5 "http://${gateway}" 2>/dev/null)
                 fi
                 if [ -n "$gw_response" ]; then
                     login_page_url=$(echo "$gw_response" | grep -oE "href='[^']+" | head -1 | sed "s/href='//")
@@ -399,7 +318,7 @@ do_login() {
 
     # 获取登录页HTML，提取RSA公钥
     local login_html rsa_key encrypted_password password_encrypt
-    login_html=$($curl_cmd -s -m 5 "$login_page_url" 2>/dev/null)
+    login_html=$(curl -s -m 10 "$login_page_url" 2>/dev/null)
     rsa_key=$(echo "$login_html" | grep -oE 'publicKey\s*=\s*["\x27][A-Za-z0-9+/=]{100,}["\x27]' | sed "s/.*=['\"]//;s/['\"]$//")
 
     # 加密密码
@@ -412,6 +331,7 @@ do_login() {
         if [ -n "$enc" ]; then
             encrypted_password="$enc"
             password_encrypt="true"
+            print_success "RSA加密成功"
         else
             print_warn "RSA加密失败，回退到明文模式"
         fi
@@ -426,7 +346,7 @@ do_login() {
     # 发送认证请求
     print_info "发送认证请求..."
     local result
-    result=$($curl_cmd -s -m 15 \
+    result=$(curl -s -m 15 \
         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36" \
         -e "$login_page_url" \
         -H "Accept: */*" \
@@ -440,29 +360,19 @@ do_login() {
     fi
 
     # 判断结果
-    local login_ok=false
-    if echo "$result" | grep -q '"success"' 2>/dev/null || echo "$result" | grep -q 'success' 2>/dev/null; then
-        login_ok=true
-    fi
-
-    if $login_ok; then
-        print_success "认证成功!${iface_tag}"
-        log_msg "LOGIN" "用户 ${USERNAME}${iface_tag} 认证成功"
-
-        # 默认路由认证成功后，顺带认证其他WLAN客户端
-        if [ -z "$iface" ]; then
-            for other in $(detect_wlan_clients); do
-                if echo "$other" | grep -q "wlan"; then
-                    do_login "" "$other"
-                fi
-            done
-        fi
+    if echo "$result" | grep -q '"success"' 2>/dev/null; then
+        print_success "认证成功!"
+        log_msg "LOGIN" "用户 ${USERNAME} 认证成功"
+        return 0
+    elif echo "$result" | grep -q 'success' 2>/dev/null; then
+        print_success "认证成功!"
+        log_msg "LOGIN" "用户 ${USERNAME} 认证成功"
         return 0
     else
         # 检查是否"同时在线用户数量上限"
         if echo "$result" | grep -q '同时在线用户数量上限' 2>/dev/null; then
             print_error "认证失败: 账号在其他设备在线"
-            log_msg "LOGIN" "认证失败: 多设备在线上限${iface_tag}"
+            log_msg "LOGIN" "认证失败: 多设备在线上限"
             return 2
         fi
         print_error "认证失败: $(echo "$result" | head -c 200)"
@@ -512,8 +422,8 @@ do_keepalive() {
     while true; do
         sleep "$interval"
 
-        # 用HTTP检测认证状态（检查所有WLAN客户端）
-        if check_all_online; then
+        # 用HTTP检测认证状态
+        if check_online; then
             continue
         fi
 
@@ -552,16 +462,8 @@ do_status() {
     echo -e "${BOLD}========================================${NC}"
 
     # 在线状态
-    if check_all_online; then
+    if check_online; then
         echo -e "  网络状态: ${GREEN}● 在线${NC}"
-        # 显示各WLAN客户端状态
-        for iface in $(detect_wlan_clients); do
-            if check_online "$iface"; then
-                echo -e "    ${iface}: ${GREEN}● 已认证${NC}"
-            else
-                echo -e "    ${iface}: ${RED}● 离线${NC}"
-            fi
-        done
     else
         echo -e "  网络状态: ${RED}● 离线${NC}"
     fi
@@ -877,20 +779,19 @@ show_menu() {
         echo -e "${BOLD}     GHU 校园网登录管理${NC}"
         echo -e "${BOLD}========================================${NC}"
 
-        # 显示状态（读取缓存，不阻塞菜单）
-        local status_file="/tmp/qhulogin_status"
-        local status="${GRAY}● 检测中...${NC}"
-
-        # 后台检测（不阻塞）
-        if [ ! -f "$status_file" ] || [ "$(($(date +%s) - $(stat -c %Y "$status_file" 2>/dev/null || echo 0)))" -gt 10 ]; then
-            (check_all_online 2>/dev/null && echo "ONLINE" || echo "OFFLINE") > "$status_file" &
-        fi
-
-        # 读取缓存
-        if [ -f "$status_file" ]; then
-            if grep -q "ONLINE" "$status_file" 2>/dev/null; then
+        # 显示简要状态（后台检测，不阻塞菜单）
+        local status="● 检测中..."
+        (
+            if check_online 2>/dev/null; then
+                echo "ONLINE" > /tmp/qhulogin_status 2>/dev/null
+            else
+                echo "OFFLINE" > /tmp/qhulogin_status 2>/dev/null
+            fi
+        ) &
+        if [ -f /tmp/qhulogin_status ]; then
+            if grep -q "ONLINE" /tmp/qhulogin_status 2>/dev/null; then
                 status="${GREEN}● 在线${NC}"
-            elif grep -q "OFFLINE" "$status_file" 2>/dev/null; then
+            else
                 status="${RED}● 离线${NC}"
             fi
         fi
