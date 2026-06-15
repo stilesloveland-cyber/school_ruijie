@@ -198,17 +198,28 @@ check_all_online() {
 #================================================================
 check_iface_online() {
     local iface="$1"
+
+    # 主方案：su nobody + --interface 绕过 Clash 并精确走目标接口
+    # su nobody(GID 65534) 匹配 openclash_output 的 RETURN 规则绕过 REDIRECT
+    # --interface $iface 绑定到目标接口，不走主路由表
+    if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
+        local code
+        code=$(su -s /bin/sh nobody -c "curl -s -I -m 3 --interface $iface -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204" 2>/dev/null)
+        # 000 = portal 拦截(未认证), 204 = 已认证, 302 = 被重定向到认证页(未认证)
+        [ "$code" = "204" ] && return 0
+        return 1
+    fi
+
+    # 回退方案：su/nobody 不可用时，用路由切换 + 普通 curl
     local gateway
     gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
     if [ -z "$gateway" ]; then
         return 1
     fi
 
-    # 查找该接口所在的策略路由表
     local other_table
     other_table=$(find_route_table "$iface")
 
-    # 备份原路由信息
     local orig_route=""
     if [ -n "$other_table" ]; then
         orig_route=$(ip route show table "$other_table" default dev "$iface" 2>/dev/null | head -1)
@@ -216,18 +227,15 @@ check_iface_online() {
         orig_route=$(ip route show default dev "$iface" 2>/dev/null | head -1)
     fi
 
-    # 切换路由到目标接口
     if [ -n "$other_table" ]; then
         ip route del default dev "$iface" table "$other_table" 2>/dev/null
     fi
     ip route del default dev "$iface" 2>/dev/null
     ip route add default via "$gateway" dev "$iface" metric 1 2>/dev/null
 
-    # 检测：未认证时 ePortal 返回 302，已认证返回 204
     local code
     code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
 
-    # 恢复路由
     ip route del default via "$gateway" dev "$iface" metric 1 2>/dev/null
     if [ -n "$orig_route" ]; then
         local restore_route
