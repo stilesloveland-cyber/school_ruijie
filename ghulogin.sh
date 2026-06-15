@@ -414,8 +414,8 @@ run_curl() {
             ip route del default dev "$LOGIN_INTERFACE" 2>/dev/null
             ip route add default via "$gateway" dev "$LOGIN_INTERFACE" metric 1 2>/dev/null
             
-            # 执行curl（此时会走目标接口）
-            result=$(curl "$@" 2>/dev/null)
+            # 执行curl（此时会走目标接口，用su nobody绕过Clash）
+            result=$(su -s /bin/sh nobody -c "curl $*" 2>/dev/null)
             exit_code=$?
             
             # 恢复路由
