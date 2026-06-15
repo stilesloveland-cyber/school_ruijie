@@ -418,87 +418,97 @@ do_logout() {
 # 2. 如果返回空，回退到路由切换方案
 #================================================================
 run_curl() {
-    if [ -n "${LOGIN_INTERFACE:-}" ] && command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
-        # 方案1：su nobody + --interface（绕过Clash且精确走目标接口）
-        local tmp_script="/tmp/_qhulogin_curl_$$"
+    # 如果没有 LOGIN_INTERFACE，直接用普通 curl
+    if [ -z "${LOGIN_INTERFACE:-}" ]; then
+        curl "$@" 2>/dev/null
+        return
+    fi
+    
+    # 检查 su 和 nobody 是否可用
+    if ! command -v su >/dev/null 2>&1 || ! id nobody >/dev/null 2>&1; then
+        # 降级：没有 su/nobody，直接用普通 curl（可能被 Clash 欺骗）
+        curl "$@" 2>/dev/null
+        return
+    fi
+    
+    # 方案1：su nobody + --interface（绕过Clash且精确走目标接口）
+    local tmp_script="/tmp/_qhulogin_curl_$$"
+    {
+        echo '#!/bin/sh'
+        printf "exec curl --interface '%s'" "$LOGIN_INTERFACE"
+        local _arg
+        for _arg in "$@"; do
+            printf " '%s'" "$(echo "$_arg" | sed "s/'/'\\\\''/g")"
+        done
+        echo
+    } > "$tmp_script"
+    chmod +r "$tmp_script"
+    local result
+    result=$(su -s /bin/sh nobody -c "$tmp_script" 2>/dev/null)
+    local exit_code=$?
+    rm -f "$tmp_script"
+    
+    # 如果有结果，直接返回
+    if [ -n "$result" ] || [ $exit_code -eq 0 ]; then
+        echo "$result"
+        return $exit_code
+    fi
+    
+    # 方案2：回退到路由切换（--interface失败时）
+    local gateway
+    gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+    if [ -n "$gateway" ]; then
+        local other_table
+        other_table=$(find_route_table "$LOGIN_INTERFACE")
+        
+        # 备份原路由
+        local orig_route=""
+        if [ -n "$other_table" ]; then
+            orig_route=$(ip route show table "$other_table" default dev "$LOGIN_INTERFACE" 2>/dev/null | head -1)
+        else
+            orig_route=$(ip route show default dev "$LOGIN_INTERFACE" 2>/dev/null | head -1)
+        fi
+        
+        # 切换路由
+        if [ -n "$other_table" ]; then
+            ip route del default dev "$LOGIN_INTERFACE" table "$other_table" 2>/dev/null
+        fi
+        ip route del default dev "$LOGIN_INTERFACE" 2>/dev/null
+        ip route add default via "$gateway" dev "$LOGIN_INTERFACE" metric 1 2>/dev/null
+        
+        # 执行curl（此时会走目标接口，用su nobody绕过Clash）
+        local tmp_script2="/tmp/_qhulogin_curl2_$$"
         {
             echo '#!/bin/sh'
-            printf "exec curl --interface '%s'" "$LOGIN_INTERFACE"
+            printf "exec curl"
             local _arg
             for _arg in "$@"; do
                 printf " '%s'" "$(echo "$_arg" | sed "s/'/'\\\\''/g")"
             done
             echo
-        } > "$tmp_script"
-        chmod +r "$tmp_script"
-        local result
-        result=$(su -s /bin/sh nobody -c "$tmp_script" 2>/dev/null)
-        local exit_code=$?
-        rm -f "$tmp_script"
+        } > "$tmp_script2"
+        chmod +r "$tmp_script2"
+        result=$(su -s /bin/sh nobody -c "$tmp_script2" 2>/dev/null)
+        exit_code=$?
+        rm -f "$tmp_script2"
         
-        # 如果有结果，直接返回
-        if [ -n "$result" ] || [ $exit_code -eq 0 ]; then
-            echo "$result"
-            return $exit_code
-        fi
-        
-        # 方案2：回退到路由切换（--interface失败时）
-        local gateway
-        gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
-        if [ -n "$gateway" ]; then
-            local other_table
-            other_table=$(find_route_table "$LOGIN_INTERFACE")
-            
-            # 备份原路由
-            local orig_route=""
+        # 恢复路由
+        ip route del default via "$gateway" dev "$LOGIN_INTERFACE" metric 1 2>/dev/null
+        if [ -n "$orig_route" ]; then
+            local restore_route
+            restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
             if [ -n "$other_table" ]; then
-                orig_route=$(ip route show table "$other_table" default dev "$LOGIN_INTERFACE" 2>/dev/null | head -1)
+                ip route add $restore_route table "$other_table" 2>/dev/null
             else
-                orig_route=$(ip route show default dev "$LOGIN_INTERFACE" 2>/dev/null | head -1)
+                ip route add $restore_route 2>/dev/null
             fi
-            
-            # 切换路由
-            if [ -n "$other_table" ]; then
-                ip route del default dev "$LOGIN_INTERFACE" table "$other_table" 2>/dev/null
-            fi
-            ip route del default dev "$LOGIN_INTERFACE" 2>/dev/null
-            ip route add default via "$gateway" dev "$LOGIN_INTERFACE" metric 1 2>/dev/null
-            
-            # 执行curl（此时会走目标接口，用su nobody绕过Clash）
-            # 同样用临时脚本传递参数，避免空格断裂
-            local tmp_script2="/tmp/_qhulogin_curl2_$$"
-            {
-                echo '#!/bin/sh'
-                printf "exec curl"
-                local _arg
-                for _arg in "$@"; do
-                    printf " '%s'" "$(echo "$_arg" | sed "s/'/'\\\\''/g")"
-                done
-                echo
-            } > "$tmp_script2"
-            chmod +r "$tmp_script2"
-            result=$(su -s /bin/sh nobody -c "$tmp_script2" 2>/dev/null)
-            exit_code=$?
-            rm -f "$tmp_script2"
-            
-            # 恢复路由
-            ip route del default via "$gateway" dev "$LOGIN_INTERFACE" metric 1 2>/dev/null
-            if [ -n "$orig_route" ]; then
-                local restore_route
-                restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
-                if [ -n "$other_table" ]; then
-                    ip route add $restore_route table "$other_table" 2>/dev/null
-                else
-                    ip route add $restore_route 2>/dev/null
-                fi
-            fi
-            
-            echo "$result"
-            return $exit_code
         fi
+        
+        echo "$result"
+        return $exit_code
     fi
     
-    # 默认：直接用curl
+    # 最终降级：没有网关，直接用普通 curl
     curl "$@" 2>/dev/null
 }
 
