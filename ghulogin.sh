@@ -1,7 +1,7 @@
 #!/bin/sh
 #================================================================
 # qhulogin - 锐捷ePortal自动认证工具
-# Version: 1.4.0
+# Version: 1.5.0
 # 功能：校园网自动登录 + 保活重连 + 命令行管理
 # 平台：iStoreOS/OpenWrt (斐讯N1)
 # 用法：qhulogin [命令]
@@ -124,28 +124,47 @@ get_service_name() {
 #================================================================
 # 网络检测
 #================================================================
+# 查找接口所在的策略路由表号（mwan3 将路由放在独立表中）
+find_route_table() {
+    local iface="$1"
+    # 从 ip route show table all 中找到该接口默认路由所在的表
+    local line tbl
+    while read -r line; do
+        if echo "$line" | grep -q "dev $iface"; then
+            tbl=$(echo "$line" | grep -oE 'table [0-9]+' | awk '{print $2}')
+            if [ -n "$tbl" ]; then
+                echo "$tbl"
+                return
+            fi
+        fi
+    done <<EOF
+$(ip route show table all default 2>/dev/null)
+EOF
+}
+
 check_online() {
-    # 直连 ePortal API 查询在线状态（不走 Clash 代理，10.x.x.x 不会被劫持）
+    # 主路径：ePortal API 直连检测（10.x.x.x 内网地址不走 Clash）
     local gateway
     gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
-    if [ -n "$gateway" ]; then
-        local username="${USERNAME:-}"
-        if [ -n "$username" ]; then
-            local user_info
-            user_info=$(curl -s -m 3 -d "userId=${username}" \
-                "http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
-            if echo "$user_info" | grep -qE '"userIndex"\s*:\s*".+"' 2>/dev/null; then
-                return 0
-            fi
+    if [ -n "$gateway" ] && [ -n "${USERNAME:-}" ]; then
+        local user_info
+        user_info=$(curl -s -m 3 -d "userId=${USERNAME}" \
+            "http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
+        if echo "$user_info" | grep -qE '"userIndex"\s*:\s*".+"' 2>/dev/null; then
+            return 0
         fi
     fi
 
-    # 备选：未配置账号时用 generate_204 快速检测（可能被 Clash 干扰）
-    if [ -z "${USERNAME:-}" ]; then
-        local code
+    # 备选：generate_204 检测（尝试以 nobody 用户绕过 Clash iptables REDIRECT）
+    # OpenClash openclash_output 链有 -m owner --gid-owner 65534 -j RETURN 规则
+    # 以 nobody(GID 65534) 身份运行 curl 可绕过 OUTPUT 链劫持
+    local code
+    if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
+        code=$(su -s /bin/sh nobody -c "curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204" 2>/dev/null)
+    else
         code=$(curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
-        [ "$code" = "204" ] && return 0
     fi
+    [ "$code" = "204" ] && return 0
 
     return 1
 }
@@ -418,18 +437,46 @@ do_login() {
             gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
             for other in $(detect_wlan_clients); do
                 if [ "$other" != "$default_iface" ] && [ -n "$gateway" ]; then
-                     print_info "从 $other 发起认证..."
-                     # 记录原metric，先删后加（ip route replace 在 OpenWrt 上会重复添加）
-                     local orig_metric
-                     orig_metric=$(ip route show default | grep "dev $other" | awk '{print $NF}')
-                     ip route del default via "$gateway" dev "$other" 2>/dev/null
-                     ip route add default via "$gateway" dev "$other" metric 1 2>/dev/null
-                     do_login
-                     # 恢复原metric
-                     ip route del default via "$gateway" dev "$other" metric 1 2>/dev/null
-                     if [ -n "$orig_metric" ]; then
-                         ip route add default via "$gateway" dev "$other" metric "$orig_metric" 2>/dev/null
-                     fi
+                    print_info "从 $other 发起认证..."
+
+                    # 查找该接口所在的策略路由表（mwan3 将路由放在独立表中）
+                    local other_table
+                    other_table=$(find_route_table "$other")
+
+                    # 备份原路由信息
+                    local orig_route=""
+                    if [ -n "$other_table" ]; then
+                        orig_route=$(ip route show table "$other_table" default dev "$other" 2>/dev/null | head -1)
+                    else
+                        orig_route=$(ip route show default dev "$other" 2>/dev/null | head -1)
+                    fi
+
+                    # 从原策略路由表删除该接口的默认路由
+                    if [ -n "$other_table" ]; then
+                        ip route del default dev "$other" table "$other_table" 2>/dev/null
+                    fi
+                    ip route del default dev "$other" 2>/dev/null
+
+                    # 在主表添加最高优先级路由，让 curl 走该接口
+                    ip route add default via "$gateway" dev "$other" metric 1 2>/dev/null
+
+                    # 强制认证（必须传 force，否则 check_online 返回在线会跳过）
+                    do_login force
+
+                    # 恢复：删除临时路由
+                    ip route del default via "$gateway" dev "$other" metric 1 2>/dev/null
+
+                    # 恢复原策略路由表路由
+                    if [ -n "$orig_route" ]; then
+                        # 去掉可能存在的 "table N" 后缀，用 ip route add 恢复
+                        local restore_route
+                        restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
+                        if [ -n "$other_table" ]; then
+                            ip route add $restore_route table "$other_table" 2>/dev/null
+                        else
+                            ip route add $restore_route 2>/dev/null
+                        fi
+                    fi
                 fi
             done
             unset AUTH_DONE
