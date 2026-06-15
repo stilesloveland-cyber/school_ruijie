@@ -679,7 +679,10 @@ start_service() {
 }
 
 stop_service() {
-    killall qhulogin 2>/dev/null
+    local pid
+    pid=$(cat /var/run/qhulogin.pid 2>/dev/null)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    killall qhulogin 2>/dev/null; true
 }
 INITEOF
     chmod +x "$INIT_SCRIPT"
@@ -781,10 +784,14 @@ do_update() {
         print_info "发现文件变更，准备更新"
     fi
 
-    # 停止服务
-    if [ -x "$INIT_SCRIPT" ]; then
-        print_info "停止服务..."
-        "$INIT_SCRIPT" stop 2>/dev/null
+    # 停止保活进程（只杀PID文件中的，不杀自己）
+    if [ -f "$PID_FILE" ]; then
+        local old_pid
+        old_pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$old_pid" ] && [ "$old_pid" != "$$" ]; then
+            kill "$old_pid" 2>/dev/null
+            sleep 1
+        fi
     fi
 
     # 替换脚本（先备份，验证后删除备份）
