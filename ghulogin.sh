@@ -364,11 +364,27 @@ do_logout() {
 #================================================================
 # curl 包装器：支持 su nobody --interface 绕过 Clash
 # 当 LOGIN_INTERFACE 设置时，用 su nobody --interface $LOGIN_INTERFACE
-# 否则直接用 curl
+# 通过临时脚本传递参数，避免 su -c 的引号/空格转义问题
 #================================================================
 run_curl() {
     if [ -n "${LOGIN_INTERFACE:-}" ] && command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
-        su -s /bin/sh nobody -c "curl --interface $LOGIN_INTERFACE $*" 2>/dev/null
+        # 写临时脚本，以 nobody 身份执行，避免参数转义问题
+        local tmp_script="/tmp/_qhulogin_curl_$$"
+        {
+            echo '#!/bin/sh'
+            printf "exec curl --interface '%s'" "$LOGIN_INTERFACE"
+            local _arg
+            for _arg in "$@"; do
+                # 单引号包裹，内部单引号用 '\'' 转义
+                printf " '%s'" "$(echo "$_arg" | sed "s/'/'\\\\''/g")"
+            done
+            echo
+        } > "$tmp_script"
+        chmod +r "$tmp_script"
+        su -s /bin/sh nobody -c "$tmp_script" 2>/dev/null
+        local ret=$?
+        rm -f "$tmp_script"
+        return $ret
     else
         curl "$@" 2>/dev/null
     fi
