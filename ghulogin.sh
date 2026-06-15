@@ -1,7 +1,7 @@
 #!/bin/sh
 #================================================================
 # qhulogin - 锐捷ePortal自动认证工具
-# Version: 1.3.2
+# Version: 1.3.3
 # 功能：校园网自动登录 + 保活重连 + 命令行管理
 # 平台：iStoreOS/OpenWrt (斐讯N1)
 # 用法：qhulogin [命令]
@@ -412,16 +412,18 @@ do_login() {
             gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
             for other in $(detect_wlan_clients); do
                 if [ "$other" != "$default_iface" ] && [ -n "$gateway" ]; then
-                    print_info "从 $other 发起认证..."
-                    # 记录原metric，切换为最高优先级
-                    local orig_metric
-                    orig_metric=$(ip route show default | grep "dev $other" | awk '{print $NF}')
-                    ip route replace default via "$gateway" dev "$other" metric 1 2>/dev/null
-                    do_login
-                    # 恢复原metric
-                    if [ -n "$orig_metric" ]; then
-                        ip route replace default via "$gateway" dev "$other" metric "$orig_metric" 2>/dev/null
-                    fi
+                     print_info "从 $other 发起认证..."
+                     # 记录原metric，先删后加（ip route replace 在 OpenWrt 上会重复添加）
+                     local orig_metric
+                     orig_metric=$(ip route show default | grep "dev $other" | awk '{print $NF}')
+                     ip route del default via "$gateway" dev "$other" 2>/dev/null
+                     ip route add default via "$gateway" dev "$other" metric 1 2>/dev/null
+                     do_login
+                     # 恢复原metric
+                     ip route del default via "$gateway" dev "$other" metric 1 2>/dev/null
+                     if [ -n "$orig_metric" ]; then
+                         ip route add default via "$gateway" dev "$other" metric "$orig_metric" 2>/dev/null
+                     fi
                 fi
             done
             unset AUTH_DONE
