@@ -501,6 +501,18 @@ do_login() {
             # 2. 通过网关IP直接访问ePortal
             local gateway=""
             gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+            
+            # 如果默认路由网关不是 10.x.x.x 网段，尝试常见校园网网关
+            if [ -z "$gateway" ] || ! echo "$gateway" | grep -qE '^10\.'; then
+                local common_gateways="10.160.0.1 10.0.0.1 10.10.0.1 192.168.1.1"
+                for gw in $common_gateways; do
+                    if ping -c 1 -W 1 "$gw" 2>/dev/null | grep -q 'bytes from'; then
+                        gateway="$gw"
+                        break
+                    fi
+                done
+            fi
+            
             if [ -n "$gateway" ]; then
                 print_info "尝试通过网关 $gateway 获取认证页..."
                 local gw_response=""
