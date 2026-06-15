@@ -2,7 +2,7 @@
 
 锐捷 ePortal Web 认证自动登录工具，运行于斐讯N1 (iStoreOS/OpenWrt)。
 
-自动认证 + Ping保活 + 断电来电自动重连，无需人工干预。
+自动认证 + HTTP在线检测保活 + 断电来电自动重连，无需人工干预。
 
 ## 依赖
 
@@ -62,7 +62,7 @@ qhulogin config
 /etc/init.d/qhulogin enable   # 开机自启
 ```
 
-启动后每30秒Ping检测一次，断网自动重连，无限重试。
+启动后每30秒HTTP检测一次，断网自动重连，无限重试。
 
 ### 断电恢复
 
@@ -76,8 +76,9 @@ qhulogin config
 USERNAME="学号"
 PASSWORD="密码"
 SERVICE="campus"          # campus/unicom/telecom/mobile
-PING_HOST="180.101.50.188"
-PING_INTERVAL="30"
+PING_INTERVAL="30"        # 在线检测间隔(秒)
+WAN_INTERFACES=""         # WAN接口(空格分隔,留空自动检测)
+FORCE_RELOGIN_AT=""       # 定时强制重连(HH:MM,留空禁用)
 ```
 
 ## 卸载

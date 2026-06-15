@@ -1,7 +1,7 @@
 #!/bin/sh
 #================================================================
 # qhulogin - 锐捷ePortal自动认证工具
-# Version: 1.6.0
+# Version: 2.0
 # 功能：校园网自动登录 + 保活重连 + 命令行管理
 # 平台：iStoreOS/OpenWrt (斐讯N1)
 # 用法：qhulogin [命令]
@@ -209,14 +209,14 @@ check_all_online() {
 }
 
 #================================================================
-# 单接口在线检测（切路由到指定接口，用 generate_204 检测是否已认证）
+# 单接口在线检测（通过 su nobody --interface 绕过 Clash，用 generate_204 检测）
 # 未认证时 ePortal 网关返回 302（10.x.x.x 不走 Clash），不会被欺骗
 # 已认证时返回 204（可能被 Clash 欺骗，但此时确实在线，误判无害）
 #================================================================
 check_iface_online() {
     local iface="$1"
 
-    # 主方案：su nobody + --interface 绕过 Clash 并精确走目标接口
+    # su nobody + --interface 绕过 Clash 并精确走目标接口
     # su nobody(GID 65534) 匹配 openclash_output 的 RETURN 规则绕过 REDIRECT
     # --interface $iface 绑定到目标接口，不走主路由表
     if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
@@ -227,56 +227,16 @@ check_iface_online() {
         return 1
     fi
 
-    # 回退方案：su/nobody 不可用时，用路由切换 + 普通 curl
-    local gateway
-    gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
-    if [ -z "$gateway" ]; then
-        return 1
-    fi
-
-    local other_table
-    other_table=$(find_route_table "$iface")
-
-    local orig_route=""
-    if [ -n "$other_table" ]; then
-        orig_route=$(ip route show table "$other_table" default dev "$iface" 2>/dev/null | head -1)
-    else
-        orig_route=$(ip route show default dev "$iface" 2>/dev/null | head -1)
-    fi
-
-    if [ -n "$other_table" ]; then
-        ip route del default dev "$iface" table "$other_table" 2>/dev/null
-    fi
-    ip route del default dev "$iface" 2>/dev/null
-    ip route add default via "$gateway" dev "$iface" metric 1 2>/dev/null
-
-    local code
-    code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
-
-    ip route del default via "$gateway" dev "$iface" metric 1 2>/dev/null
-    if [ -n "$orig_route" ]; then
-        local restore_route
-        restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
-        if [ -n "$other_table" ]; then
-            ip route add $restore_route table "$other_table" 2>/dev/null || \
-                print_warn "恢复 $iface 路由到 table $other_table 失败"
-        else
-            ip route add $restore_route 2>/dev/null || \
-                print_warn "恢复 $iface 路由失败"
-        fi
-    else
-        print_warn "$iface 原路由信息为空，跳过恢复"
-    fi
-
-    [ "$code" = "204" ] && return 0
+    # su/nobody 不可用时，无法绑定接口检测，直接返回离线
+    print_warn "$iface: su/nobody 不可用，无法检测接口在线状态"
     return 1
 }
 
 #================================================================
-# 切换路由到指定接口并执行认证，完成后恢复路由
+# 绑定指定接口执行认证（通过 su nobody --interface 绕过 Clash）
 # 复用于 do_login 多网卡认证 + keepalive 逐接口保活
 #================================================================
-switch_route_and_login() {
+bind_iface_and_login() {
     local iface="$1"
 
     print_info "从 $iface 发起认证..."
@@ -299,7 +259,7 @@ rsa_encrypt_password() {
     local password="$2"
 
     # 将Base64公钥写入临时文件
-    local pubkey_file="/tmp/qhulogin_pubkey.pem"
+    local pubkey_file="/tmp/qhulogin_pubkey_$$.pem"
     echo "-----BEGIN PUBLIC KEY-----" > "$pubkey_file"
     echo "$pubkey" | fold -w 64 >> "$pubkey_file"
     echo "-----END PUBLIC KEY-----" >> "$pubkey_file"
@@ -353,7 +313,7 @@ do_logout() {
     query_url="${logout_url/method=logout/method=getOnlineUserInfo}"
 
     local info
-    info=$(curl -s -m 10 -d "userId=${USERNAME}" "$query_url" 2>/dev/null)
+    info=$(run_curl -s -m 10 -d "userId=${USERNAME}" "$query_url" 2>/dev/null)
     if [ -n "$info" ]; then
         user_index=$(echo "$info" | grep -oE '"userIndex"\s*:\s*"[^"]*"' | sed 's/.*: *"//;s/"//')
     fi
@@ -361,10 +321,10 @@ do_logout() {
     # 发送登出请求
     local logout_result
     if [ -n "$user_index" ]; then
-        logout_result=$(curl -s -m 10 -d "userIndex=${user_index}" "$logout_url" 2>/dev/null)
+        logout_result=$(run_curl -s -m 10 -d "userIndex=${user_index}" "$logout_url" 2>/dev/null)
     else
         # 没有userIndex，尝试用userId登出
-        logout_result=$(curl -s -m 10 -d "userId=${USERNAME}" "$logout_url" 2>/dev/null)
+        logout_result=$(run_curl -s -m 10 -d "userId=${USERNAME}" "$logout_url" 2>/dev/null)
     fi
 
     if echo "$logout_result" | grep -q 'success' 2>/dev/null; then
@@ -614,7 +574,7 @@ do_login() {
             default_iface=$(ip route show default | grep '^default' | awk '{print $5}' | head -1)
             for other in $(detect_wlan_clients); do
                 if [ "$other" != "$default_iface" ]; then
-                    switch_route_and_login "$other"
+                    bind_iface_and_login "$other"
                 fi
             done
             unset AUTH_DONE
@@ -657,6 +617,14 @@ do_keepalive() {
     # 写入PID
     echo $$ > "$PID_FILE"
 
+    # 信号处理：清理PID文件后退出
+    _keepalive_cleanup() {
+        rm -f "$PID_FILE" 2>/dev/null
+        log_msg "KEEPALIVE" "保活进程收到信号退出"
+        exit 0
+    }
+    trap '_keepalive_cleanup' INT TERM
+
     # 初始认证（带重试+退避）
     local retry=0
     local backoff=5
@@ -674,14 +642,29 @@ do_keepalive() {
             backoff=5
             print_warn "初始认证未成功，${backoff}秒后重试 ($retry/30)"
         fi
-        sleep "$backoff"
+        # 拆分sleep确保信号响应
+        local _slept=0
+        while [ $_slept -lt "$backoff" ]; do
+            sleep 1
+            _slept=$((_slept + 1))
+        done
     done
+
+    if [ $retry -ge 30 ]; then
+        print_warn "初始认证30次重试均失败，进入保活循环继续尝试"
+        log_msg "KEEPALIVE" "初始认证30次重试均失败"
+    fi
 
     # 保活循环
     local interval="${PING_INTERVAL:-30}"
     local relogin_date_file="/tmp/qhulogin_relogin_date"
     while true; do
-        sleep "$interval"
+        # 拆分sleep为1秒循环，确保信号能及时响应
+        local slept=0
+        while [ $slept -lt "$interval" ]; do
+            sleep 1
+            slept=$((slept + 1))
+        done
 
         # 定时强制重连（每天指定时间触发一次）
         if [ -n "${FORCE_RELOGIN_AT:-}" ]; then
@@ -720,7 +703,12 @@ do_keepalive() {
                     backoff=10
                     print_warn "重连失败，${backoff}秒后重试 (第${reconnect}次)"
                 fi
-                sleep "$backoff"
+                # 拆分sleep确保信号响应
+                local _slept2=0
+                while [ $_slept2 -lt "$backoff" ]; do
+                    sleep 1
+                    _slept2=$((_slept2 + 1))
+                done
             done
             continue
         fi
@@ -730,7 +718,7 @@ do_keepalive() {
             if ! check_iface_online "$iface"; then
                 print_warn "$iface 未认证，发起认证..."
                 log_msg "KEEPALIVE" "$iface 未认证，发起认证"
-                switch_route_and_login "$iface"
+                bind_iface_and_login "$iface"
             fi
         done
     done
@@ -979,8 +967,8 @@ do_uninstall() {
 # 更新
 #================================================================
 do_update() {
-    local repo="https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/master/ghulogin.sh"
-    local mirror="https://ghfast.top/https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/master/ghulogin.sh"
+    local repo="https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/master/qhulogin.sh"
+    local mirror="https://ghfast.top/https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/master/qhulogin.sh"
     local tmp_file="/tmp/qhulogin_update.sh"
 
     print_info "正在检查更新..."
