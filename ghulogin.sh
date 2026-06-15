@@ -129,12 +129,7 @@ check_online() {
     local iface="${1:-}"
     local curl_cmd="curl"
     if [ -n "$iface" ]; then
-        # 尝试绑定接口IP（比 --interface 更可靠）
-        local ip
-        ip=$(ip addr show dev "$iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
-        if [ -n "$ip" ]; then
-            curl_cmd="curl --bind-address $ip"
-        fi
+        curl_cmd="curl --interface $iface"
     fi
 
     # 快速检测：单个URL，2s超时
@@ -257,7 +252,7 @@ do_logout() {
 #================================================================
 do_login() {
     local force="${1:-}"
-    local bind_ip="${2:-}"
+    local bind_iface="${2:-}"
 
     # 加载配置
     load_config 2>/dev/null
@@ -268,23 +263,24 @@ do_login() {
         return 1
     fi
 
-    # 构造curl命令（可选绑定来源IP，用于多网卡分别认证）
+    # 构造curl命令（可选绑定来源接口，用于多网卡分别认证）
     local curl_cmd="curl"
     local ip_tag=""
-    if [ -n "$bind_ip" ]; then
-        curl_cmd="curl --bind-address $bind_ip"
-        local iface_name
-        iface_name=$(ip addr show 2>/dev/null | grep "inet ${bind_ip}/" | awk '{print $NF}' | head -1)
-        ip_tag=" [${iface_name:-unknown}:$bind_ip]"
-    else
-        # 默认路由的网卡名
-        local default_iface
-        default_iface=$(ip route show default 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
-        local default_ip
-        default_ip=$(ip route get 8.8.8.8 2>/dev/null | head -1 | awk '{print $7}')
-        if [ -n "$default_iface" ] && [ -n "$default_ip" ]; then
-            ip_tag=" [$default_iface:$default_ip]"
-        fi
+    if [ -n "$bind_iface" ]; then
+        curl_cmd="curl --interface $bind_iface"
+    fi
+
+    # 获取本机IP用于日志显示（从默认路由或指定接口）
+    local my_ip=""
+    local my_iface="$bind_iface"
+    if [ -z "$my_iface" ]; then
+        my_iface=$(ip route show default 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
+    fi
+    if [ -n "$my_iface" ]; then
+        my_ip=$(ip addr show dev "$my_iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
+    fi
+    if [ -n "$my_iface" ] && [ -n "$my_ip" ]; then
+        ip_tag=" [$my_iface:$my_ip]"
     fi
 
     # 非强制模式：已在线则跳过
@@ -428,16 +424,14 @@ do_login() {
         print_success "认证成功!${ip_tag}"
         log_msg "LOGIN" "用户 ${USERNAME}${ip_tag} 认证成功"
 
-        # 默认路由认证成功后，用 --bind-address 认证其他WLAN客户端
-        if [ -z "$bind_ip" ]; then
-            local my_ip
-            my_ip=$(ip -4 route get 8.8.8.8 2>/dev/null | head -1 | awk '{print $7}')
+        # 默认路由认证成功后，用 --interface 认证其他WLAN客户端
+        if [ -z "$bind_iface" ]; then
+            local default_iface
+            default_iface=$(ip route show default 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
             for other in $(detect_wlan_clients); do
-                local other_ip
-                other_ip=$(ip addr show dev "$other" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
-                if [ -n "$other_ip" ] && [ "$other_ip" != "$my_ip" ]; then
-                    print_info "从 $other ($other_ip) 发起认证..."
-                    do_login "" "$other_ip"
+                if [ "$other" != "$default_iface" ]; then
+                    print_info "从 $other 发起认证..."
+                    do_login "" "$other"
                 fi
             done
         fi
