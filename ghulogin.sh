@@ -31,6 +31,39 @@ readonly LOG_FILE="/var/log/qhulogin.log"
 readonly PID_FILE="/var/run/qhulogin.pid"
 readonly INIT_SCRIPT="/etc/init.d/qhulogin"
 readonly CACHE_FILE="${CONF_DIR}/.login_cache"
+readonly NIC_FILE="${CONF_DIR}/.nic_cache"
+
+#================================================================
+# 自动检测出口网卡
+#================================================================
+detect_nic() {
+    # 优先使用缓存
+    if [ -f "$NIC_FILE" ]; then
+        cat "$NIC_FILE"
+        return
+    fi
+    # 通过默认路由获取出口网卡
+    local nic=""
+    nic=$(ip route 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
+    if [ -z "$nic" ]; then
+        nic=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $8}' | head -1)
+    fi
+    if [ -n "$nic" ]; then
+        echo "$nic" > "$NIC_FILE"
+    fi
+    echo "${nic:-eth0}"
+}
+
+# curl 统一封装（自动绑定出口网卡）
+do_curl() {
+    local nic
+    nic=$(detect_nic)
+    if [ -n "$nic" ] && [ "$nic" != "lo" ]; then
+        curl --interface "$nic" "$@"
+    else
+        curl "$@"
+    fi
+}
 
 #================================================================
 # 运营商映射
@@ -116,11 +149,11 @@ get_service_name() {
 #================================================================
 check_online() {
     local code
-    code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
+    code=$(do_curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204 2>/dev/null)
     if [ "$code" = "204" ]; then
         return 0
     fi
-    code=$(curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
+    code=$(do_curl -s -I -m 3 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
     if [ "$code" = "204" ]; then
         return 0
     fi
@@ -189,7 +222,7 @@ do_logout() {
     query_url="${logout_url/method=logout/method=getOnlineUserInfo}"
 
     local info
-    info=$(curl -s -m 10 -d "userId=${USERNAME}" "$query_url" 2>/dev/null)
+    info=$(do_curl -s -m 10 -d "userId=${USERNAME}" "$query_url" 2>/dev/null)
     if [ -n "$info" ]; then
         user_index=$(echo "$info" | grep -oE '"userIndex"\s*:\s*"[^"]*"' | sed 's/.*: *"//;s/"//')
     fi
@@ -197,10 +230,10 @@ do_logout() {
     # 发送登出请求
     local logout_result
     if [ -n "$user_index" ]; then
-        logout_result=$(curl -s -m 10 -d "userIndex=${user_index}" "$logout_url" 2>/dev/null)
+        logout_result=$(do_curl -s -m 10 -d "userIndex=${user_index}" "$logout_url" 2>/dev/null)
     else
         # 没有userIndex，尝试用userId登出
-        logout_result=$(curl -s -m 10 -d "userId=${USERNAME}" "$logout_url" 2>/dev/null)
+        logout_result=$(do_curl -s -m 10 -d "userId=${USERNAME}" "$logout_url" 2>/dev/null)
     fi
 
     if echo "$logout_result" | grep -q 'success' 2>/dev/null; then
@@ -239,7 +272,7 @@ do_login() {
 
     # 获取认证页面
     local response
-    response=$(curl -s -L -m 10 "http://www.google.cn/generate_204" 2>/dev/null)
+    response=$(do_curl -s -L -m 10 "http://www.google.cn/generate_204" 2>/dev/null)
 
     # 提取登录页URL
     local login_page_url=""
@@ -277,9 +310,9 @@ do_login() {
             if [ -n "$gateway" ]; then
                 print_info "尝试通过网关 $gateway 获取认证页..."
                 local gw_response=""
-                gw_response=$(curl -s -L -m 5 "http://${gateway}/eportal/index.jsp" 2>/dev/null)
+                gw_response=$(do_curl -s -L -m 5 "http://${gateway}/eportal/index.jsp" 2>/dev/null)
                 if [ -z "$gw_response" ]; then
-                    gw_response=$(curl -s -L -m 5 "http://${gateway}" 2>/dev/null)
+                    gw_response=$(do_curl -s -L -m 5 "http://${gateway}" 2>/dev/null)
                 fi
                 if [ -n "$gw_response" ]; then
                     login_page_url=$(echo "$gw_response" | grep -oE "href='[^']+" | head -1 | sed "s/href='//")
@@ -318,7 +351,7 @@ do_login() {
 
     # 获取登录页HTML，提取RSA公钥
     local login_html rsa_key encrypted_password password_encrypt
-    login_html=$(curl -s -m 10 "$login_page_url" 2>/dev/null)
+    login_html=$(do_curl -s -m 10 "$login_page_url" 2>/dev/null)
     rsa_key=$(echo "$login_html" | grep -oE 'publicKey\s*=\s*["\x27][A-Za-z0-9+/=]{100,}["\x27]' | sed "s/.*=['\"]//;s/['\"]$//")
 
     # 加密密码
@@ -346,7 +379,7 @@ do_login() {
     # 发送认证请求
     print_info "发送认证请求..."
     local result
-    result=$(curl -s -m 15 \
+    result=$(do_curl -s -m 15 \
         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36" \
         -e "$login_page_url" \
         -H "Accept: */*" \
