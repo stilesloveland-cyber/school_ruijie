@@ -37,8 +37,10 @@ readonly CACHE_FILE="${CONF_DIR}/.login_cache"
 #================================================================
 detect_wlan_clients() {
     # 从主路由表和 mwan3 策略路由表获取所有有默认路由的接口
+    # 过滤掉 br-lan/docker0 等非无线接口，只保留 wlan*/eth*.* (VLAN子接口)
     (ip route show default 2>/dev/null; ip route show table all 2>/dev/null | grep '^default') | \
         awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | \
+        grep -E '^wlan|^eth[0-9]+\.' | \
         sort -u
 }
 
@@ -472,10 +474,16 @@ do_login() {
                         local restore_route
                         restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
                         if [ -n "$other_table" ]; then
-                            ip route add $restore_route table "$other_table" 2>/dev/null
+                            if ! ip route add $restore_route table "$other_table" 2>/dev/null; then
+                                print_warn "恢复 $other 路由到 table $other_table 失败: $restore_route"
+                            fi
                         else
-                            ip route add $restore_route 2>/dev/null
+                            if ! ip route add $restore_route 2>/dev/null; then
+                                print_warn "恢复 $other 路由失败: $restore_route"
+                            fi
                         fi
+                    else
+                        print_warn "$other 原路由信息为空，跳过恢复"
                     fi
                 fi
             done
@@ -578,13 +586,19 @@ do_status() {
     # 在线状态
     if check_all_online; then
         echo -e "  网络状态: ${GREEN}● 在线${NC}"
-        # 显示各WLAN客户端（通过路由表判断）
+        # 显示各WLAN客户端（通过路由表判断，包括 mwan3 策略路由表）
         for iface in $(detect_wlan_clients); do
-            # 检查该接口是否有默认路由
+            # 检查该接口是否有默认路由（主表 + 所有策略路由表）
             local has_route
-            has_route=$(ip route show default 2>/dev/null | grep -c "dev $iface")
+            has_route=$(( $(ip route show default 2>/dev/null | grep -c "dev $iface") + $(ip route show table all default 2>/dev/null | grep -c "dev $iface") ))
             if [ "$has_route" -gt 0 ]; then
-                echo -e "    ${iface}: ${GREEN}● 已接入${NC}"
+                local iface_ip
+                iface_ip=$(ip addr show dev "$iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
+                if [ -n "$iface_ip" ]; then
+                    echo -e "    ${iface}: ${GREEN}● 已接入${NC} ($iface_ip)"
+                else
+                    echo -e "    ${iface}: ${GREEN}● 已接入${NC}"
+                fi
             else
                 echo -e "    ${iface}: ${GRAY}○ 备用${NC}"
             fi
