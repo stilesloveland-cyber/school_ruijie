@@ -160,22 +160,29 @@ EOF
 }
 
 check_online() {
-    # 主路径：逐接口检测 ePortal API（10.x.x.x 内网地址不走 Clash）
+    # 获取网关（优先默认路由，失败则尝试常见校园网网关）
     local gateway
     gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
+    
+    # 如果默认路由网关不是 10.x.x.x 网段，尝试常见校园网网关
+    if [ -z "$gateway" ] || ! echo "$gateway" | grep -qE '^10\.'; then
+        # 尝试常见校园网网关地址
+        local common_gateways="10.160.0.1 10.0.0.1 10.10.0.1 192.168.1.1"
+        for gw in $common_gateways; do
+            # 测试是否能 ping 通
+            if ping -c 1 -W 1 "$gw" 2>/dev/null | grep -q 'bytes from'; then
+                gateway="$gw"
+                break
+            fi
+        done
+    fi
+    
     if [ -n "$gateway" ] && [ -n "${USERNAME:-}" ]; then
         for iface in $(detect_wlan_clients); do
             local user_info
-            # 对每个接口尝试检测（用 --interface 绑定或路由切换）
             if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
-                # 优先用 su nobody --interface 绕过 Clash 并绑定接口
                 user_info=$(su -s /bin/sh nobody -c "curl --interface $iface -s -m 3 -d \"userId=${USERNAME}\" http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
-                # 如果 --interface 失败，回退到路由切换
-                if [ -z "$user_info" ]; then
-                    user_info=$(check_online_via_route "$gateway" "$iface" "$USERNAME")
-                fi
             else
-                # 没有 su/nobody，直接 curl（可能被 Clash 欺骗）
                 user_info=$(curl -s -m 3 -d "userId=${USERNAME}" \
                     "http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
             fi
@@ -185,7 +192,6 @@ check_online() {
         done
     fi
 
-    # 备选：generate_204 检测（尝试以 nobody 用户绕过 Clash iptables REDIRECT）
     local code
     if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
         code=$(su -s /bin/sh nobody -c "curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204" 2>/dev/null)
@@ -195,45 +201,6 @@ check_online() {
     [ "$code" = "204" ] && return 0
 
     return 1
-}
-
-# 通过路由切换检测指定接口的在线状态
-check_online_via_route() {
-    local gateway="$1"
-    local iface="$2"
-    local username="$3"
-    
-    local other_table
-    other_table=$(find_route_table "$iface")
-    
-    local orig_route=""
-    if [ -n "$other_table" ]; then
-        orig_route=$(ip route show table "$other_table" default dev "$iface" 2>/dev/null | head -1)
-    else
-        orig_route=$(ip route show default dev "$iface" 2>/dev/null | head -1)
-    fi
-    
-    if [ -n "$other_table" ]; then
-        ip route del default dev "$iface" table "$other_table" 2>/dev/null
-    fi
-    ip route del default dev "$iface" 2>/dev/null
-    ip route add default via "$gateway" dev "$iface" metric 1 2>/dev/null
-    
-    local result
-    result=$(su -s /bin/sh nobody -c "curl -s -m 3 -d \"userId=${username}\" http://${gateway}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
-    
-    ip route del default via "$gateway" dev "$iface" metric 1 2>/dev/null
-    if [ -n "$orig_route" ]; then
-        local restore_route
-        restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
-        if [ -n "$other_table" ]; then
-            ip route add $restore_route table "$other_table" 2>/dev/null
-        else
-            ip route add $restore_route 2>/dev/null
-        fi
-    fi
-    
-    echo "$result"
 }
 
 check_all_online() {
@@ -412,10 +379,9 @@ do_logout() {
 }
 
 #================================================================
-# curl 包装器：支持 su nobody --interface 绕过 Clash
-# 当 LOGIN_INTERFACE 设置时：
-# 1. 优先用 su nobody --interface（绕过Clash + 绑定接口）
-# 2. 如果返回空，回退到路由切换方案
+# curl 包装器：支持 su nobody --interface 绕过 Clash（不修改路由表）
+# 当 LOGIN_INTERFACE 设置时，用 su nobody --interface $LOGIN_INTERFACE
+# 不修改路由表，完全依赖 --interface 绑定接口
 #================================================================
 run_curl() {
     # 如果没有 LOGIN_INTERFACE，直接用普通 curl
@@ -431,7 +397,7 @@ run_curl() {
         return
     fi
     
-    # 方案1：su nobody + --interface（绕过Clash且精确走目标接口）
+    # 仅用 su nobody + --interface（绕过Clash且绑定接口，不修改路由表）
     local tmp_script="/tmp/_qhulogin_curl_$$"
     {
         echo '#!/bin/sh'
@@ -445,70 +411,15 @@ run_curl() {
     chmod +r "$tmp_script"
     local result
     result=$(su -s /bin/sh nobody -c "$tmp_script" 2>/dev/null)
-    local exit_code=$?
     rm -f "$tmp_script"
     
     # 如果有结果，直接返回
-    if [ -n "$result" ] || [ $exit_code -eq 0 ]; then
+    if [ -n "$result" ]; then
         echo "$result"
-        return $exit_code
+        return
     fi
     
-    # 方案2：回退到路由切换（--interface失败时）
-    local gateway
-    gateway=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $2}' | head -1)
-    if [ -n "$gateway" ]; then
-        local other_table
-        other_table=$(find_route_table "$LOGIN_INTERFACE")
-        
-        # 备份原路由
-        local orig_route=""
-        if [ -n "$other_table" ]; then
-            orig_route=$(ip route show table "$other_table" default dev "$LOGIN_INTERFACE" 2>/dev/null | head -1)
-        else
-            orig_route=$(ip route show default dev "$LOGIN_INTERFACE" 2>/dev/null | head -1)
-        fi
-        
-        # 切换路由
-        if [ -n "$other_table" ]; then
-            ip route del default dev "$LOGIN_INTERFACE" table "$other_table" 2>/dev/null
-        fi
-        ip route del default dev "$LOGIN_INTERFACE" 2>/dev/null
-        ip route add default via "$gateway" dev "$LOGIN_INTERFACE" metric 1 2>/dev/null
-        
-        # 执行curl（此时会走目标接口，用su nobody绕过Clash）
-        local tmp_script2="/tmp/_qhulogin_curl2_$$"
-        {
-            echo '#!/bin/sh'
-            printf "exec curl"
-            local _arg
-            for _arg in "$@"; do
-                printf " '%s'" "$(echo "$_arg" | sed "s/'/'\\\\''/g")"
-            done
-            echo
-        } > "$tmp_script2"
-        chmod +r "$tmp_script2"
-        result=$(su -s /bin/sh nobody -c "$tmp_script2" 2>/dev/null)
-        exit_code=$?
-        rm -f "$tmp_script2"
-        
-        # 恢复路由
-        ip route del default via "$gateway" dev "$LOGIN_INTERFACE" metric 1 2>/dev/null
-        if [ -n "$orig_route" ]; then
-            local restore_route
-            restore_route=$(echo "$orig_route" | sed 's/ *table [0-9]*//')
-            if [ -n "$other_table" ]; then
-                ip route add $restore_route table "$other_table" 2>/dev/null
-            else
-                ip route add $restore_route 2>/dev/null
-            fi
-        fi
-        
-        echo "$result"
-        return $exit_code
-    fi
-    
-    # 最终降级：没有网关，直接用普通 curl
+    # 降级：--interface 失败，直接用普通 curl（走默认路由）
     curl "$@" 2>/dev/null
 }
 
