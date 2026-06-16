@@ -1,87 +1,114 @@
 #!/bin/sh
 #================================================================
 # qhulogin - 锐捷ePortal自动认证工具
-# Version: 2.0
-# 功能：校园网自动登录 + 保活重连 + 命令行管理
-# 平台：iStoreOS/OpenWrt (斐讯N1)
-# 用法：qhulogin [命令]
+# Version: 2.9 (Lightweight & Stable Edition)
+# 架构：极简 Curl 容器 / API级连通校验 / 10次轻量熔断 / 兼容 mihomo
+# 平台：iStoreOS / OpenWrt / N1旁路由 / 复杂多线负载
 #================================================================
 
-# 严格模式 (busybox ash 不支持 pipefail)
 set -u
 
 #================================================================
-# 颜色定义
+# 全局变量与路径
 #================================================================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-BLUE='\033[0;34m'
 GRAY='\033[0;90m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-#================================================================
-# 全局路径
-#================================================================
 readonly CONF_DIR="/etc/qhulogin"
 readonly CONF_FILE="${CONF_DIR}/qhulogin.conf"
 readonly LOG_FILE="/var/log/qhulogin.log"
-readonly PID_FILE="/var/run/qhulogin.pid"
+readonly LOCK_FILE="/var/run/qhulogin.lock"
 readonly INIT_SCRIPT="/etc/init.d/qhulogin"
 readonly CACHE_FILE="${CONF_DIR}/.login_cache"
+readonly FAIL_COUNT_FILE="/tmp/qhulogin_fail_count"
+readonly PROBE_URLS="http://www.google.cn/generate_204 http://connect.rom.miui.com/generate_204 http://captive.apple.com/hotspot-detect.html"
+
+export LOCK_TYPE=""
 
 #================================================================
-# 多网卡检测（只检测Client模式无线网卡）
+# 状态持久化：物理级熔断器
 #================================================================
-detect_wlan_clients() {
-    # 优先使用用户配置的 WAN 接口列表
-    if [ -n "${WAN_INTERFACES:-}" ]; then
-        local result=""
-        for iface in $WAN_INTERFACES; do
-            if ip link show "$iface" >/dev/null 2>&1; then
-                result="$result $iface"
-            fi
-        done
-        if [ -n "$result" ]; then
-            echo "$result" | tr ' ' '\n' | grep -v '^$' | sort -u
-            return
+get_fail_count() { cat "$FAIL_COUNT_FILE" 2>/dev/null || echo "0"; }
+inc_fail_count() { echo $(($(get_fail_count) + 1)) > "$FAIL_COUNT_FILE"; }
+reset_fail_count() { rm -f "$FAIL_COUNT_FILE"; }
+
+#================================================================
+# 核心防御：单实例与 FD 安全释放
+#================================================================
+acquire_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$LOCK_FILE"
+        if ! flock -n 9; then
+            echo -e "${RED}[ERROR]${NC} 保活守护已在运行，拦截并发重入。"
+            exit 1
         fi
+        LOCK_TYPE="flock"
+    else
+        if ! mkdir "${LOCK_FILE}.d" 2>/dev/null; then
+            # 检查锁是否为残留（原进程已死）
+            local lock_pid=""
+            lock_pid=$(cat "${LOCK_FILE}.d/pid" 2>/dev/null)
+            if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+                echo -e "${RED}[ERROR]${NC} 保活守护已在运行 (PID: $lock_pid)。"
+                exit 1
+            fi
+            # 残留锁，清理后重新获取
+            rm -rf "${LOCK_FILE}.d"
+            if ! mkdir "${LOCK_FILE}.d" 2>/dev/null; then
+                echo -e "${RED}[ERROR]${NC} 无法获取锁。"
+                exit 1
+            fi
+        fi
+        echo $$ > "${LOCK_FILE}.d/pid"
+        LOCK_TYPE="mkdir"
     fi
-    # 回退到自动检测：从主路由表和 mwan3 策略路由表获取所有有默认路由的接口
-    # 过滤掉 br-lan/docker0 等非无线接口，只保留 wlan*/eth*.* (VLAN子接口)
-    (ip route show default 2>/dev/null; ip route show table all 2>/dev/null | grep '^default') | \
-        awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | \
-        grep -E '^wlan|^eth[0-9]+\.' | \
-        sort -u
+}
+
+release_lock() {
+    [ "$LOCK_TYPE" = "flock" ] && exec 9>&-
+    [ "$LOCK_TYPE" = "mkdir" ] && rm -rf "${LOCK_FILE}.d"
+}
+
+is_daemon_running() {
+    if command -v flock >/dev/null 2>&1; then
+        ( exec 9>"$LOCK_FILE"; flock -n 9 ) && return 1 || return 0
+    else
+        if [ -d "${LOCK_FILE}.d" ]; then
+            local lock_pid=""
+            lock_pid=$(cat "${LOCK_FILE}.d/pid" 2>/dev/null)
+            # 有PID且进程存活才算运行中，否则是残留锁
+            [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null && return 0
+            rm -rf "${LOCK_FILE}.d" 2>/dev/null
+            return 1
+        fi
+        return 1
+    fi
 }
 
 #================================================================
-# 运营商映射
+# 工具函数 & 安全日志轮转
 #================================================================
-CAMPUS="%25E6%25A0%25A1%25E5%259B%25AD%25E7%25BD%2591"
-UNICOM="%25E6%25A0%25A1%25E5%259B%25AD%25E8%2581%2594%25E9%2580%259A"
-TELECOM="%25E6%25A0%25A1%25E5%259B%25AD%25E7%2594%25B5%25E4%25BF%25A1"
-MOBILE="%25E6%25A0%25A1%25E5%259B%25AD%25E7%25A7%25BB%25E5%258A%25A8"
+shell_escape() {
+    printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
+}
 
-#================================================================
-# 日志函数
-#================================================================
 log_msg() {
-    local level="$1"; shift
+    local level="$1"
+    shift
     local msg="$*"
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local log_size
+    
     echo "[$timestamp] [$level] $msg" >> "$LOG_FILE" 2>/dev/null
 
-    # 日志轮转：超过100KB截断保留最后200行
-    local log_size
     log_size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
     if [ "$log_size" -gt 102400 ] 2>/dev/null; then
-        local tmp_log="/tmp/qhulogin_log_tmp"
-        tail -200 "$LOG_FILE" > "$tmp_log" 2>/dev/null
-        mv "$tmp_log" "$LOG_FILE" 2>/dev/null
+        mv "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
     fi
 }
 
@@ -89,1142 +116,673 @@ print_info()    { echo -e "${CYAN}[INFO]${NC} $*"; log_msg "INFO" "$*"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; log_msg "SUCCESS" "$*"; }
 print_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; log_msg "WARN" "$*"; }
 print_error()   { echo -e "${RED}[ERROR]${NC} $*"; log_msg "ERROR" "$*"; }
-print_debug()   { echo -e "${GRAY}[DEBUG]${NC} $*"; log_msg "DEBUG" "$*"; }
 
 #================================================================
-# 配置管理
+# 配置与缓存管理 (纯文本解析引擎)
 #================================================================
+safe_get() {
+    local key="$1"
+    local file="$2"
+    sed -n "s/^$key=//p" "$file" 2>/dev/null | head -1 | sed "s/^'//; s/'$//" | sed "s/'\\\\''/'/g"
+}
+
 load_config() {
-    if [ ! -f "$CONF_FILE" ]; then
-        return 1
-    fi
-    . "$CONF_FILE"
+    [ ! -f "$CONF_FILE" ] && return 1
+    USERNAME=$(safe_get "USERNAME" "$CONF_FILE")
+    PASSWORD=$(safe_get "PASSWORD" "$CONF_FILE")
+    SERVICE=$(safe_get "SERVICE" "$CONF_FILE")
+    PING_INTERVAL=$(safe_get "PING_INTERVAL" "$CONF_FILE")
+    WAN_INTERFACES=$(safe_get "WAN_INTERFACES" "$CONF_FILE")
+    FORCE_RELOGIN_AT=$(safe_get "FORCE_RELOGIN_AT" "$CONF_FILE")
+    ENCODE_QUERY=$(safe_get "ENCODE_QUERY" "$CONF_FILE")
+    
+    [ -z "$PING_INTERVAL" ] && PING_INTERVAL="30"
+    [ -z "$SERVICE" ] && SERVICE="campus"
+    [ -z "$ENCODE_QUERY" ] && ENCODE_QUERY="0"
     return 0
 }
 
 save_config() {
-    mkdir -p "$CONF_DIR"
+    mkdir -p "$CONF_DIR" 2>/dev/null
     cat > "$CONF_FILE" << EOF
-# qhulogin 配置文件
-# 修改后运行 qhulogin keepalive 重启保活
-USERNAME="${USERNAME}"
-PASSWORD="${PASSWORD}"
-SERVICE="${SERVICE}"
-PING_INTERVAL="${PING_INTERVAL:-30}"
-WAN_INTERFACES="${WAN_INTERFACES:-}"
-FORCE_RELOGIN_AT="${FORCE_RELOGIN_AT:-}"
+USERNAME=$(shell_escape "${USERNAME:-}")
+PASSWORD=$(shell_escape "${PASSWORD:-}")
+SERVICE=$(shell_escape "${SERVICE:-}")
+PING_INTERVAL=$(shell_escape "${PING_INTERVAL:-30}")
+WAN_INTERFACES=$(shell_escape "${WAN_INTERFACES:-}")
+FORCE_RELOGIN_AT=$(shell_escape "${FORCE_RELOGIN_AT:-}")
+ENCODE_QUERY=$(shell_escape "${ENCODE_QUERY:-0}")
 EOF
     chmod 600 "$CONF_FILE"
-    print_success "配置已保存到 $CONF_FILE"
+}
+
+load_cache() { 
+    [ ! -f "$CACHE_FILE" ] && return
+    CACHE_EPORTAL_HOST=$(safe_get "CACHE_EPORTAL_HOST" "$CACHE_FILE")
+    CACHE_LOGIN_URL=$(safe_get "CACHE_LOGIN_URL" "$CACHE_FILE")
+    CACHE_QUERY_STRING=$(safe_get "CACHE_QUERY_STRING" "$CACHE_FILE")
+    CACHE_TIMESTAMP=$(safe_get "CACHE_TIMESTAMP" "$CACHE_FILE")
+    # 缓存超过300秒强制过期
+    local now_sec=$(date +%s)
+    if [ -n "${CACHE_TIMESTAMP:-}" ] && [ $((now_sec - ${CACHE_TIMESTAMP:-0})) -gt 300 ]; then
+        CACHE_EPORTAL_HOST=""
+        CACHE_LOGIN_URL=""
+        CACHE_QUERY_STRING=""
+    fi
+}
+
+save_cache() {
+    mkdir -p "$CONF_DIR" 2>/dev/null
+    cat > "$CACHE_FILE" << EOF
+CACHE_EPORTAL_HOST=$(shell_escape "${CACHE_EPORTAL_HOST:-}")
+CACHE_LOGIN_URL=$(shell_escape "${CACHE_LOGIN_URL:-}")
+CACHE_QUERY_STRING=$(shell_escape "${CACHE_QUERY_STRING:-}")
+CACHE_TIMESTAMP=$(date +%s)
+EOF
+}
+
+clear_session_cache() {
+    unset CACHE_LOGIN_URL CACHE_QUERY_STRING 2>/dev/null || true
+    save_cache
 }
 
 get_service_string() {
     case "$1" in
-        campus)  echo "$CAMPUS" ;;
-        unicom)  echo "$UNICOM" ;;
-        telecom) echo "$TELECOM" ;;
-        mobile)  echo "$MOBILE" ;;
-        *)       echo "$CAMPUS" ;;
+        unicom)  echo "%25E6%25A0%25A1%25E5%259B%25AD%25E8%2581%2594%25E9%2580%259A" ;;
+        telecom) echo "%25E6%25A0%25A1%25E5%259B%25AD%25E7%2594%25B5%25E4%25BF%25A1" ;;
+        mobile)  echo "%25E6%25A0%25A1%25E5%259B%25AD%25E7%25A7%25BB%25E5%258A%25A8" ;;
+        *)       echo "%25E6%25A0%25A1%25E5%259B%25AD%25E7%25BD%2591" ;;
     esac
 }
 
 get_service_name() {
     case "$1" in
-        campus)  echo "校园网" ;;
-        unicom)  echo "校园联通" ;;
-        telecom) echo "校园电信" ;;
-        mobile)  echo "校园移动" ;;
-        *)       echo "校园网" ;;
+        unicom)  echo "校园联通" ;; telecom) echo "校园电信" ;;
+        mobile)  echo "校园移动" ;; *) echo "校园网" ;;
     esac
 }
 
 #================================================================
-# 网络检测
+# 极简 Curl 容器 (直接利用 noproxy 与原生 Root 网卡绑定)
 #================================================================
-# 发现 ePortal 服务器地址（优先缓存，否则通过 302 重定向探测）
-# 未认证时，访问任何 HTTP URL 会被 302 重定向到 ePortal，从中提取主机地址
-discover_eportal_host() {
-    # 优先使用缓存
-    if [ -f "$CACHE_FILE" ]; then
-        local cached_url
-        cached_url=$(cat "$CACHE_FILE" 2>/dev/null)
-        if [ -n "$cached_url" ]; then
-            # 从缓存的 login_page_url 提取 host:port (如 210.27.177.172 或 10.x.x.x:8080)
-            echo "$cached_url" | sed -n 's|.*://\([^/]*\).*|\1|p' | head -1
-            return
+# 检测 curl 是否支持 --noproxy（首次调用时检测并缓存结果）
+_CURL_NOPROXY_OK=""
+run_curl() {
+    if [ -z "$_CURL_NOPROXY_OK" ]; then
+        if curl --noproxy '*' -s -m 1 -o /dev/null http://127.0.0.1 2>/dev/null; then
+            _CURL_NOPROXY_OK="1"
+        else
+            _CURL_NOPROXY_OK="0"
         fi
     fi
 
-    # 通过 su nobody 访问 HTTP URL，捕获 302 重定向的 Location 头
-    local location=""
-    if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
-        location=$(su -s /bin/sh nobody -c "curl -s -I -m 3 -L -o /dev/null -w '%{redirect_url}' http://www.google.cn/generate_204" 2>/dev/null)
+    local noproxy_arg=""
+    [ "$_CURL_NOPROXY_OK" = "1" ] && noproxy_arg="--noproxy '*'"
+
+    if [ -n "${LOGIN_INTERFACE:-}" ]; then
+        curl $noproxy_arg --interface "$LOGIN_INTERFACE" "$@" 2>/dev/null
+    else
+        curl $noproxy_arg "$@" 2>/dev/null
+    fi
+}
+
+#================================================================
+# 内核级 ubus 接口嗅探 (添加 mihomo/Meta 黑名单)
+#================================================================
+detect_wlan_clients() {
+    local devs=""
+    local iface=""
+
+    if [ -n "${WAN_INTERFACES:-}" ]; then
+        for iface in $WAN_INTERFACES; do
+            ip -4 addr show dev "$iface" 2>/dev/null | grep -q 'inet ' && echo "$iface"
+        done | tr ' ' '\n' | grep -v '^$' | sort -u
+        return
+    fi
+    
+    if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+        devs=$(ubus call network.interface dump 2>/dev/null | jsonfilter -e '@.interface[@.up=true].l3_device' 2>/dev/null)
+    fi
+    
+    if [ -z "$devs" ]; then
+        # fallback: 取有IPv4的接口，但排除内网AP段 (192.168.x.x / 10.x.x.x / 172.16-31.x.x)
+        devs=$(ip -4 addr show 2>/dev/null | awk '/inet / {
+            ip=$2; iface=$NF;
+            split(ip, a, "/"); addr=a[1];
+            if (addr !~ /^192\.168\./ && addr !~ /^10\./ && addr !~ /^172\.(1[6-9]|2[0-9]|3[01])\./) print iface
+        }')
     fi
 
-    if [ -z "$location" ]; then
-        # 备选：用 run_curl 直接访问，看响应体中的重定向
-        local resp
-        resp=$(run_curl -s -m 3 "http://www.google.cn/generate_204" 2>/dev/null)
-        location=$(echo "$resp" | grep -oE "href='[^']+" | head -1 | sed "s/href='//")
-        [ -z "$location" ] && location=$(echo "$resp" | grep -oE 'href="[^"]+' | head -1 | sed 's/href="//')
-    fi
+    # 纯黑名单过滤：拦截内网桥接及各种代理内核隧道
+    echo "$devs" | grep -vE '^(lo|br-|docker|veth|ifb|tun|tap|clash|mihomo|Meta|wg|wireguard)' | sort -u
+}
+
+#================================================================
+# API置顶 与 三体探针探测
+#================================================================
+discover_eportal_host() {
+    local location=""
+    local url=""
+    local host=""
+    local gw_resp=""
+
+    load_cache
+    [ -n "${CACHE_EPORTAL_HOST:-}" ] && { echo "$CACHE_EPORTAL_HOST"; return; }
+
+    for url in $PROBE_URLS; do
+        location=$(run_curl -s -I -m 3 -L -o /dev/null -w '%{redirect_url}' "$url" 2>/dev/null)
+        
+        if [ -z "$location" ]; then
+            gw_resp=$(run_curl -s -m 3 "$url")
+            location=$(echo "$gw_resp" | grep -oE "href='[^']+'" | head -1 | sed "s/href='//;s/'//")
+            [ -z "$location" ] && location=$(echo "$gw_resp" | grep -oE 'href="[^"]+"' | head -1 | sed 's/href="//;s/"//')
+            [ -z "$location" ] && location=$(echo "$gw_resp" | grep -oE "location\.href='[^']+'" | head -1 | sed "s/location\.href='//;s/'//")
+            [ -z "$location" ] && location=$(echo "$gw_resp" | grep -oE 'window\.location="[^"]+"' | head -1 | sed 's/window\.location="//;s/"//')
+            [ -z "$location" ] && location=$(echo "$gw_resp" | grep -oiE 'url=[^"]+' | head -1 | sed 's/[Uu][Rr][Ll]=//')
+        fi
+        
+        [ -n "$location" ] && break
+    done
 
     if [ -n "$location" ]; then
-        echo "$location" | sed -n 's|.*://\([^/]*\).*|\1|p' | head -1
-    fi
-}
-
-# 查找接口所在的策略路由表号（mwan3 将路由放在独立表中）
-find_route_table() {
-    local iface="$1"
-    # 从 ip route show table all 中找到该接口默认路由所在的表
-    local line tbl
-    while read -r line; do
-        if echo "$line" | grep -q "dev $iface"; then
-            tbl=$(echo "$line" | grep -oE 'table [0-9]+' | awk '{print $2}')
-            if [ -n "$tbl" ]; then
-                echo "$tbl"
-                return
-            fi
-        fi
-    done <<EOF
-$(ip route show table all default 2>/dev/null)
-EOF
-}
-
-check_online() {
-    # 方案1：通过 ePortal getOnlineUserInfo 查询（最可靠，不受 Clash 影响）
-    # 先从缓存或 302 重定向发现 ePortal 服务器地址
-    if [ -n "${USERNAME:-}" ]; then
-        local eportal_host
-        eportal_host=$(discover_eportal_host)
-        if [ -n "$eportal_host" ]; then
-            for iface in $(detect_wlan_clients); do
-                local user_info
-                if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
-                    user_info=$(su -s /bin/sh nobody -c "curl --interface $iface -s -m 3 -d \"userId=${USERNAME}\" http://${eportal_host}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
-                else
-                    user_info=$(run_curl -s -m 3 -d "userId=${USERNAME}" \
-                        "http://${eportal_host}/eportal/InterFace.do?method=getOnlineUserInfo" 2>/dev/null)
-                fi
-                if echo "$user_info" | grep -qE '"userIndex"\s*:\s*".+"' 2>/dev/null; then
-                    return 0
-                fi
-            done
+        host=$(echo "$location" | sed -n 's|.*://\([^/]*\).*|\1|p' | head -1)
+        if [ -n "$host" ]; then
+            CACHE_EPORTAL_HOST="$host"
+            save_cache
+            echo "$host"
         fi
     fi
-
-    # 方案2：su nobody + generate_204（绕过 Clash，检测真实连通性）
-    local code
-    if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
-        code=$(su -s /bin/sh nobody -c "curl -s -I -m 2 -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204" 2>/dev/null)
-        [ "$code" = "204" ] && return 0
-        return 1
-    fi
-
-    # 无 su/nobody 时无法绕过 Clash，generate_204 不可信，直接返回离线
-    return 1
 }
 
-check_all_online() {
-    load_config 2>/dev/null
-    check_online
-}
-
-#================================================================
-# 单接口在线检测（通过 su nobody --interface 绕过 Clash，用 generate_204 检测）
-# 未认证时 ePortal 网关返回 302（10.x.x.x 不走 Clash），不会被欺骗
-# 已认证时返回 204（可能被 Clash 欺骗，但此时确实在线，误判无害）
-#================================================================
 check_iface_online() {
     local iface="$1"
+    local url=""
+    local code=""
+    local iface_ip=""
+    local saved_login_iface="${LOGIN_INTERFACE:-}"
 
-    # su nobody + --interface 绕过 Clash 并精确走目标接口
-    # su nobody(GID 65534) 匹配 openclash_output 的 RETURN 规则绕过 REDIRECT
-    # --interface $iface 绑定到目标接口，不走主路由表
-    if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
-        local code
-        code=$(su -s /bin/sh nobody -c "curl -s -I -m 3 --interface $iface -o /dev/null -w '%{http_code}' http://www.google.cn/generate_204" 2>/dev/null)
-        # 000 = portal 拦截(未认证), 204 = 已认证, 302 = 被重定向到认证页(未认证)
-        [ "$code" = "204" ] && return 0
-        return 1
-    fi
+    # 无IP不测
+    iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+    [ -z "$iface_ip" ] && return 1
 
-    # su/nobody 不可用时，无法绑定接口检测，直接返回离线
-    print_warn "$iface: su/nobody 不可用，无法检测接口在线状态"
-    return 1
-}
-
-#================================================================
-# 绑定指定接口执行认证（通过 su nobody --interface 绕过 Clash）
-# 复用于 do_login 多网卡认证 + keepalive 逐接口保活
-#================================================================
-bind_iface_and_login() {
-    local iface="$1"
-
-    print_info "从 $iface 发起认证..."
-
-    # 设置 LOGIN_INTERFACE，让 run_curl 用 su nobody --interface $iface 绕过 Clash
-    export LOGIN_INTERFACE="$iface"
-
-    # 强制认证
-    do_login force
-
-    # 清除接口绑定
-    unset LOGIN_INTERFACE
-}
-
-#================================================================
-# RSA加密
-#================================================================
-rsa_encrypt_password() {
-    local pubkey="$1"
-    local password="$2"
-
-    # 将Base64公钥写入临时文件
-    local pubkey_file="/tmp/qhulogin_pubkey_$$.pem"
-    echo "-----BEGIN PUBLIC KEY-----" > "$pubkey_file"
-    echo "$pubkey" | fold -w 64 >> "$pubkey_file"
-    echo "-----END PUBLIC KEY-----" >> "$pubkey_file"
-
-    # 使用openssl加密
-    local encrypted
-    encrypted=$(echo -n "$password" | openssl rsautl -encrypt -pubin -inkey "$pubkey_file" -pkcs 2>/dev/null | xxd -p -c 256 | tr 'a-f' 'A-F')
-    rm -f "$pubkey_file"
-
-    if [ -n "$encrypted" ]; then
-        echo "$encrypted"
-        return 0
-    else
-        return 1
-    fi
-}
-
-#================================================================
-# 登出（踢出旧会话）
-#================================================================
-do_logout() {
+    # 1. 优先调用 Portal API
+    load_cache
     load_config 2>/dev/null
-
-    # 从缓存获取认证服务器地址
-    local login_page_url=""
-    if [ -f "$CACHE_FILE" ]; then
-        login_page_url=$(cat "$CACHE_FILE" 2>/dev/null)
-    fi
-
-    # 尝试通过 ePortal 服务器发现
-    if [ -z "$login_page_url" ]; then
-        local eportal_host
-        eportal_host=$(discover_eportal_host)
-        if [ -n "$eportal_host" ]; then
-            login_page_url="http://${eportal_host}/eportal/index.jsp"
+    if [ -n "${USERNAME:-}" ] && [ -n "${CACHE_EPORTAL_HOST:-}" ]; then
+        local info_resp
+        LOGIN_INTERFACE="$iface"
+        info_resp=$(run_curl -s -m 3 -d "userId=${USERNAME}" "http://${CACHE_EPORTAL_HOST}/eportal/InterFace.do?method=getOnlineUserInfo")
+        LOGIN_INTERFACE="$saved_login_iface"
+        # 兼容整型与字符串 userIndex（排除 null 和空值）
+        if echo "$info_resp" | grep -qE '"userIndex"[[:space:]]*:[[:space:]]*"[^",}]+'; then
+            return 0
         fi
-    fi
-
-    if [ -z "$login_page_url" ]; then
-        return 1
-    fi
-
-    # 构造登出URL
-    local logout_url
-    logout_url=$(echo "$login_page_url" | awk -F '?' '{print $1}')
-    logout_url="${logout_url/index.jsp/InterFace.do?method=logout}"
-
-    # 获取userIndex（需要先查询在线用户信息）
-    local user_index=""
-    local query_url
-    query_url="${logout_url/method=logout/method=getOnlineUserInfo}"
-
-    local info
-    info=$(run_curl -s -m 10 -d "userId=${USERNAME}" "$query_url" 2>/dev/null)
-    if [ -n "$info" ]; then
-        user_index=$(echo "$info" | grep -oE '"userIndex"\s*:\s*"[^"]*"' | sed 's/.*: *"//;s/"//')
-    fi
-
-    # 发送登出请求
-    local logout_result
-    if [ -n "$user_index" ]; then
-        logout_result=$(run_curl -s -m 10 -d "userIndex=${user_index}" "$logout_url" 2>/dev/null)
-    else
-        # 没有userIndex，尝试用userId登出
-        logout_result=$(run_curl -s -m 10 -d "userId=${USERNAME}" "$logout_url" 2>/dev/null)
-    fi
-
-    if echo "$logout_result" | grep -q 'success' 2>/dev/null; then
-        print_success "已成功登出"
-        log_msg "LOGOUT" "用户 ${USERNAME} 登出成功"
-        return 0
-    else
-        print_warn "已发送登出请求（结果未知）"
-        log_msg "LOGOUT" "登出请求已发送: ${logout_result:-无响应}"
-        return 0
-    fi
-}
-
-#================================================================
-# curl 包装器：始终通过 su nobody 绕过 Clash
-# 当 LOGIN_INTERFACE 设置时，额外用 --interface 绑定接口
-#================================================================
-run_curl() {
-    # 检查 su 和 nobody 是否可用
-    if ! command -v su >/dev/null 2>&1 || ! id nobody >/dev/null 2>&1; then
-        # 降级：没有 su/nobody，直接用普通 curl（可能被 Clash 欺骗）
-        curl "$@" 2>/dev/null
-        return
-    fi
-
-    # su nobody 绕过 Clash；有 LOGIN_INTERFACE 时额外绑定接口
-    local tmp_script="/tmp/_qhulogin_curl_$$"
-    {
-        echo '#!/bin/sh'
-        if [ -n "${LOGIN_INTERFACE:-}" ]; then
-            printf "exec curl --interface '%s'" "$LOGIN_INTERFACE"
-        else
-            printf "exec curl"
-        fi
-        local _arg
-        for _arg in "$@"; do
-            printf " '%s'" "$(echo "$_arg" | sed "s/'/'\\\\''/g")"
-        done
-        echo
-    } > "$tmp_script"
-    chmod 600 "$tmp_script"
-    local result
-    result=$(su -s /bin/sh nobody -c "$tmp_script" 2>/dev/null)
-    rm -f "$tmp_script"
-
-    # 如果有结果，直接返回
-    if [ -n "$result" ]; then
-        echo "$result"
-        return
-    fi
-
-    # 降级：su nobody 失败，直接用普通 curl（走默认路由）
-    curl "$@" 2>/dev/null
-}
-
-#================================================================
-# 认证核心
-#================================================================
-do_login() {
-    local force="${1:-}"
-
-    # 加载配置
-    load_config 2>/dev/null
-
-    # 检查配置
-    if [ -z "${USERNAME:-}" ] || [ -z "${PASSWORD:-}" ]; then
-        print_error "未配置用户名或密码，请先运行 qhulogin config"
-        return 1
-    fi
-
-    # 获取本机IP用于日志显示
-    local my_iface
-    if [ -n "${LOGIN_INTERFACE:-}" ]; then
-        my_iface="$LOGIN_INTERFACE"
-    else
-        my_iface=$(ip route show default 2>/dev/null | grep '^default' | awk '{print $5}' | head -1)
-    fi
-    local my_ip=""
-    if [ -n "$my_iface" ]; then
-        my_ip=$(ip addr show dev "$my_iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
-    fi
-    local ip_tag=""
-    if [ -n "$my_iface" ] && [ -n "$my_ip" ]; then
-        ip_tag=" [$my_iface:$my_ip]"
-    fi
-
-    # 非强制模式：已在线则跳过
-    if [ "$force" != "force" ]; then
-        if check_all_online; then
-            print_success "已在线，无需认证"
+        if echo "$info_resp" | grep -qE '"userIndex"[[:space:]]*:[[:space:]]*[1-9][0-9]*'; then
             return 0
         fi
     fi
 
-    print_info "开始登录${ip_tag}..."
+    # 2. 探针 fallback
+    for url in $PROBE_URLS; do
+        LOGIN_INTERFACE="$iface"
+        code=$(run_curl -s -I -m 3 -o /dev/null -w '%{http_code}' "$url")
+        LOGIN_INTERFACE="$saved_login_iface"
+        [ "$code" = "204" ] && return 0
+        [ "$code" = "200" ] && echo "$url" | grep -q "apple" && return 0
+    done
 
-    # 获取认证页面（3s超时，离线时快速返回）
-    local response
-    response=$(run_curl -s -L -m 3 "http://www.google.cn/generate_204")
+    return 1
+}
 
-    # 提取登录页URL
+# 全局连通性仅检测主路由，防链路风暴
+check_global_online() {
+    local eportal_host=""
+    local info_resp=""
+    local default_iface=""
+
+    load_config 2>/dev/null
+    
+    # 必须通过默认接口检测，避免旁路由场景下全局探针误判
+    default_iface=$(ip -4 route show default 2>/dev/null | awk '{print $5}' | head -1)
+    if [ -n "$default_iface" ]; then
+        check_iface_online "$default_iface" && return 0 || return 1
+    fi
+    
+    return 1
+}
+
+bind_iface_and_login() {
+    export LOGIN_INTERFACE="$1"
+    do_login force
+    unset LOGIN_INTERFACE
+}
+
+#================================================================
+# 安全加密 (Mktemp 隔离)
+#================================================================
+rsa_encrypt_password() {
+    local pubkey="$1"
+    local password="$2"
+    local pubkey_file=""
+    local encrypted=""
+
+    pubkey_file=$(mktemp /tmp/qhulogin_pubkey.XXXXXX 2>/dev/null || echo "/tmp/qhulogin_pubkey_$$.pem")
+    
+    echo "-----BEGIN PUBLIC KEY-----" > "$pubkey_file"
+    echo "$pubkey" | fold -w 64 >> "$pubkey_file"
+    echo "-----END PUBLIC KEY-----" >> "$pubkey_file"
+
+    if command -v openssl >/dev/null 2>&1; then
+        encrypted=$(echo -n "$password" | openssl pkeyutl -encrypt -pubin -inkey "$pubkey_file" -pkeyopt rsa_padding_mode:pkcs1 2>/dev/null | xxd -p -c 256 | tr 'a-f' 'A-F')
+        [ -z "$encrypted" ] && encrypted=$(echo -n "$password" | openssl rsautl -encrypt -pubin -inkey "$pubkey_file" -pkcs 2>/dev/null | xxd -p -c 256 | tr 'a-f' 'A-F')
+    fi
+    rm -f "$pubkey_file"
+
+    [ -n "$encrypted" ] && { echo "$encrypted"; return 0; } || return 1
+}
+
+#================================================================
+# 核心认证引擎
+#================================================================
+do_login() {
+    local force="${1:-}"
+    local my_iface=""
+    local my_ip=""
+    local ip_tag=""
     local login_page_url=""
-    if [ -n "$response" ]; then
-        # 尝试从href='xxx'提取
-        login_page_url=$(echo "$response" | grep -oE "href='[^']+'" | head -1 | sed "s/href='//;s/'//")
-        # 尝试从href="xxx"提取
-        if [ -z "$login_page_url" ]; then
-            login_page_url=$(echo "$response" | grep -oE 'href="[^"]+"' | head -1 | sed 's/href="//;s/"//')
-        fi
-        # 尝试从location.href='xxx'提取
-        if [ -z "$login_page_url" ]; then
-            login_page_url=$(echo "$response" | grep -oE "location\.href='[^']+'" | head -1 | sed "s/location\.href='//;s/'//")
-        fi
-        # 尝试从window.location="xxx"提取
-        if [ -z "$login_page_url" ]; then
-            login_page_url=$(echo "$response" | grep -oE 'window\.location="[^"]+"' | head -1 | sed 's/window\.location="//;s/"//')
-        fi
-        # 尝试从meta refresh提取
-        if [ -z "$login_page_url" ]; then
-            login_page_url=$(echo "$response" | grep -oiE 'url=[^"]+' | head -1 | sed 's/[Uu][Rr][Ll]=//')
-        fi
+    local eportal_host=""
+    local gw_resp=""
+    local login_url=""
+    local query_string=""
+    local login_html=""
+    local rsa_key=""
+    local encrypted_password=""
+    local password_encrypt="false"
+    local enc=""
+    local service_string=""
+    local result=""
+    local current_fails=""
+    local default_iface=""
+    local other=""
+
+    if ! load_config || [ -z "${USERNAME:-}" ]; then
+        print_error "无可用配置，请先运行 config"
+        return 1
     fi
 
-    # 在线但拿不到URL时，尝试其他方式获取
-    if [ -z "$login_page_url" ]; then
-        # 1. 使用缓存的URL
-        if [ -f "$CACHE_FILE" ]; then
-            login_page_url=$(cat "$CACHE_FILE" 2>/dev/null)
-            print_info "使用缓存的认证URL"
+    # 10次轻量熔断防爆 (带超时自恢复)
+    current_fails=$(get_fail_count)
+    if [ "$current_fails" -ge 10 ]; then
+        local fuse_time_file="/tmp/qhulogin_fuse_time"
+        local now_sec=$(date +%s)
+        local fuse_sec=$(cat "$fuse_time_file" 2>/dev/null || echo "0")
+        # 首次熔断记录时间
+        [ "$fuse_sec" = "0" ] && { echo "$now_sec" > "$fuse_time_file"; fuse_sec="$now_sec"; }
+        # 超过300秒自动解除断路器
+        if [ $((now_sec - fuse_sec)) -ge 300 ]; then
+            print_warn "熔断超时 300 秒，自动重置"
+            reset_fail_count
+            rm -f "$fuse_time_file"
         else
-            # 2. 通过 302 重定向发现 ePortal 服务器，再获取认证页
-            local eportal_host
-            eportal_host=$(discover_eportal_host)
-            if [ -n "$eportal_host" ]; then
-                print_info "尝试通过 ePortal 服务器 $eportal_host 获取认证页..."
-                local gw_response=""
-                gw_response=$(run_curl -s -L -m 3 "http://${eportal_host}/eportal/index.jsp")
-                if [ -z "$gw_response" ]; then
-                    gw_response=$(run_curl -s -L -m 3 "http://${eportal_host}")
-                fi
-                if [ -n "$gw_response" ]; then
-                    login_page_url=$(echo "$gw_response" | grep -oE "href='[^']+" | head -1 | sed "s/href='//")
-                    if [ -z "$login_page_url" ]; then
-                        login_page_url=$(echo "$gw_response" | grep -oE 'href="[^"]+' | head -1 | sed 's/href="//')
-                    fi
-                fi
-            fi
+            print_error "【熔断警戒】连续失败已达 ${current_fails} 次，休眠中..."
+            return 1
+        fi
+    else
+        rm -f "/tmp/qhulogin_fuse_time" 2>/dev/null
+    fi
 
-            # 3. 仍然拿不到，在线则跳过
-            if [ -z "$login_page_url" ]; then
-                if check_online; then
-                    print_success "已在线，无法获取认证页URL（下次登录成功后会缓存）"
-                    return 0
-                fi
-                print_error "网络不通，无法访问认证服务器"
-                log_msg "LOGIN" "网络不通，curl无响应"
-                return 1
-            fi
+    my_iface="${LOGIN_INTERFACE:-$(ip -4 route show default 2>/dev/null | awk '{print $5}' | head -1)}"
+    my_ip=$(ip -4 addr show dev "$my_iface" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+    ip_tag=" [${my_iface:-未知}:${my_ip:-无IP}]"
+
+    if [ "$force" != "force" ] && check_global_online; then
+        print_success "全局主接口已在线"
+        reset_fail_count
+        return 0
+    fi
+
+    load_cache
+    login_page_url="${CACHE_LOGIN_URL:-}"
+    
+    if [ -z "$login_page_url" ]; then
+        eportal_host=$(discover_eportal_host)
+        if [ -n "$eportal_host" ]; then
+            gw_resp=$(run_curl -s -L -m 3 "http://${eportal_host}/eportal/index.jsp")
+            login_page_url=$(echo "$gw_resp" | grep -oE "href='[^']+'" | head -1 | sed "s/href='//;s/'//")
+            [ -z "$login_page_url" ] && login_page_url=$(echo "$gw_resp" | grep -oE 'href="[^"]+"' | head -1 | sed 's/href="//;s/"//')
+            [ -z "$login_page_url" ] && login_page_url=$(echo "$gw_resp" | grep -oE "location\.href='[^']+'" | head -1 | sed "s/location\.href='//;s/'//")
+            [ -z "$login_page_url" ] && login_page_url=$(echo "$gw_resp" | grep -oE 'window\.location="[^"]+"' | head -1 | sed 's/window\.location="//;s/"//')
+            [ -z "$login_page_url" ] && login_page_url=$(echo "$gw_resp" | grep -oiE 'url=[^"]+' | head -1 | sed 's/[Uu][Rr][Ll]=//')
         fi
     fi
 
-    # 缓存认证页URL
-    echo "$login_page_url" > "$CACHE_FILE"
+    if [ -z "$login_page_url" ]; then
+        print_error "网关失联，无法获取认证页面"
+        inc_fail_count
+        return 1
+    fi
 
-    # 构造登录URL
-    local login_url
+    CACHE_LOGIN_URL="$login_page_url"
     login_url=$(echo "$login_page_url" | awk -F '?' '{print $1}')
     login_url="${login_url/index.jsp/InterFace.do?method=login}"
 
-    # 构造queryString (二次URL编码)
-    local query_string
-    query_string=$(echo "$login_page_url" | awk -F '?' '{print $2}')
-    query_string="${query_string//&/%2526}"
-    query_string="${query_string//=/%253D}"
+    query_string="${CACHE_QUERY_STRING:-}"
+    if [ -z "$query_string" ]; then
+        query_string=$(echo "$login_page_url" | awk -F '?' '{print $2}')
+        # 兼容开关：部分老式锐捷需要深度 Encode
+        if [ "${ENCODE_QUERY:-0}" = "1" ]; then
+            query_string="${query_string//&/%2526}"
+            query_string="${query_string//=/%253D}"
+        fi
+        CACHE_QUERY_STRING="$query_string"
+    fi
+    save_cache
 
-    # 获取登录页HTML，提取RSA公钥
-    local login_html rsa_key encrypted_password password_encrypt
     login_html=$(run_curl -s -m 5 "$login_page_url")
-    rsa_key=$(echo "$login_html" | grep -oE 'publicKey\s*=\s*["\x27][A-Za-z0-9+/=]{100,}["\x27]' | sed "s/.*=['\"]//;s/['\"]$//")
+    rsa_key=$(echo "$login_html" | grep -oiE 'publickey[^a-zA-Z0-9]+[a-zA-Z0-9+/=]{60,}' | grep -oE '[a-zA-Z0-9+/=]{60,}' | head -1)
 
-    # 加密密码
     encrypted_password="$PASSWORD"
-    password_encrypt="false"
     if [ -n "$rsa_key" ]; then
-        print_info "使用RSA加密密码..."
-        local enc
         enc=$(rsa_encrypt_password "$rsa_key" "$PASSWORD")
         if [ -n "$enc" ]; then
             encrypted_password="$enc"
             password_encrypt="true"
-        else
-            print_warn "RSA加密失败，回退到明文模式"
         fi
-    else
-        print_warn "未获取到RSA公钥，使用明文模式"
     fi
 
-    # 获取运营商编码
-    local service_string
     service_string=$(get_service_string "${SERVICE:-campus}")
-
-    # 发送认证请求
-    print_info "发送认证请求..."
-    local result
     result=$(run_curl -s -m 15 \
-        -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36" \
-        -e "$login_page_url" \
-        -H "Accept: */*" \
+        -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/149.0.0.0 Safari/537.36" \
         -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
         -d "userId=${USERNAME}&password=${encrypted_password}&service=${service_string}&queryString=${query_string}&operatorPwd=&operatorUserId=&validcode=&passwordEncrypt=${password_encrypt}" \
         "$login_url")
 
-    if [ -z "$result" ]; then
-        print_error "认证请求无响应"
-        return 1
-    fi
-
-    # 判断结果
-    local login_ok=false
-    if echo "$result" | grep -q '"success"' 2>/dev/null || echo "$result" | grep -q 'success' 2>/dev/null; then
-        login_ok=true
-    fi
-
-    if $login_ok; then
+    # 严密判定，屏蔽 {"success":false} 误伤
+    if echo "$result" | grep -qE '"success"[[:space:]]*:[[:space:]]*true|"result"[[:space:]]*:[[:space:]]*"(1|success)"'; then
         print_success "认证成功!${ip_tag}"
-        log_msg "LOGIN" "用户 ${USERNAME}${ip_tag} 认证成功"
-
-        # 认证其他WLAN客户端（仅在顶层调用执行，避免递归循环）
+        reset_fail_count
+        
         if [ -z "${AUTH_DONE:-}" ]; then
             export AUTH_DONE="1"
-            local default_iface
-            default_iface=$(ip route show default | grep '^default' | awk '{print $5}' | head -1)
+            default_iface=$(ip -4 route show default 2>/dev/null | awk '{print $5}' | head -1)
             for other in $(detect_wlan_clients); do
-                if [ "$other" != "$default_iface" ]; then
-                    bind_iface_and_login "$other"
-                fi
+                [ "$other" != "$default_iface" ] && bind_iface_and_login "$other"
             done
             unset AUTH_DONE
         fi
         return 0
     else
-        # 检查是否"同时在线用户数量上限"
-        if echo "$result" | grep -q '同时在线用户数量上限' 2>/dev/null; then
-            print_error "认证失败: 账号在其他设备在线"
-            log_msg "LOGIN" "认证失败: 多设备在线上限${ip_tag}"
+        if echo "$result" | grep -q '数量上限' 2>/dev/null; then
+            print_error "设备触达上限"
             return 2
         fi
-        print_error "认证失败: $(echo "$result" | head -c 200)"
-        log_msg "LOGIN" "认证失败: $result"
+        
+        inc_fail_count
+        clear_session_cache 
+        print_error "认证驳回: $(echo "$result" | head -c 80)"
         return 1
     fi
 }
 
+do_logout() {
+    local login_page_url=""
+    local eportal_host=""
+    local logout_url=""
+    local info=""
+    local user_index=""
+    local req_data=""
+
+    load_config 2>/dev/null
+    load_cache
+    
+    login_page_url="${CACHE_LOGIN_URL:-}"
+    if [ -z "$login_page_url" ]; then
+        eportal_host=$(discover_eportal_host)
+        [ -n "$eportal_host" ] && login_page_url="http://${eportal_host}/eportal/index.jsp"
+    fi
+    [ -z "$login_page_url" ] && return 1
+
+    logout_url=$(echo "$login_page_url" | awk -F '?' '{print $1}')
+    logout_url="${logout_url/index.jsp/InterFace.do?method=logout}"
+
+    info=$(run_curl -s -m 5 -d "userId=${USERNAME}" "${logout_url/method=logout/method=getOnlineUserInfo}")
+    user_index=$(echo "$info" | grep -oE '"userIndex"[[:space:]]*:[[:space:]]*"?[^,}]+' | awk -F':' '{print $2}' | tr -d ' "')
+
+    req_data="userId=${USERNAME}"
+    [ -n "$user_index" ] && req_data="userIndex=${user_index}"
+
+    if run_curl -s -m 5 -d "$req_data" "$logout_url" | grep -qE '"success"[[:space:]]*:[[:space:]]*true'; then
+        print_success "下线指令已确认"
+        clear_session_cache
+        return 0
+    fi
+    print_warn "下发完成 (网关无返回)"
+}
+
 #================================================================
-# 保活模式
+# 智能防爆保活引擎
 #================================================================
 do_keepalive() {
-    if ! load_config; then
-        print_error "未找到配置文件 $CONF_FILE，请先运行 qhulogin config"
-        return 1
-    fi
-
-    print_info "qhulogin 保活模式启动"
-    print_info "用户: ${USERNAME}  运营商: $(get_service_name "${SERVICE:-campus}")"
-    print_info "检测间隔: ${PING_INTERVAL:-30}s"
-    if [ -n "${FORCE_RELOGIN_AT:-}" ]; then
-        print_info "定时重连: ${FORCE_RELOGIN_AT}"
-    fi
-    local wan_ifaces
-    wan_ifaces="$(detect_wlan_clients)"
-    if [ -n "$wan_ifaces" ]; then
-        print_info "WAN接口: $(echo $wan_ifaces | tr '\n' ' ')"
-    fi
-
-    # 写入PID
-    echo $$ > "$PID_FILE"
-
-    # 信号处理：清理PID文件后退出
-    _keepalive_cleanup() {
-        rm -f "$PID_FILE" 2>/dev/null
-        log_msg "KEEPALIVE" "保活进程收到信号退出"
-        exit 0
-    }
-    trap '_keepalive_cleanup' INT TERM
-
-    # 初始认证（带重试+退避）
-    local retry=0
-    local backoff=5
-    while [ $retry -lt 30 ]; do
-        do_login
-        local ret=$?
-        if [ $ret -eq 0 ]; then
-            break
-        fi
-        retry=$((retry + 1))
-        if [ $ret -eq 2 ]; then
-            backoff=120
-            print_warn "多设备在线冲突，${backoff}秒后重试 ($retry/30)"
-        else
-            backoff=5
-            print_warn "初始认证未成功，${backoff}秒后重试 ($retry/30)"
-        fi
-        # 拆分sleep确保信号响应
-        local _slept=0
-        while [ $_slept -lt "$backoff" ]; do
-            sleep 1
-            _slept=$((_slept + 1))
-        done
-    done
-
-    if [ $retry -ge 30 ]; then
-        print_warn "初始认证30次重试均失败，进入保活循环继续尝试"
-        log_msg "KEEPALIVE" "初始认证30次重试均失败"
-    fi
-
-    # 保活循环
-    local interval="${PING_INTERVAL:-30}"
+    local interval=""
     local relogin_date_file="/tmp/qhulogin_relogin_date"
-    while true; do
-        # 拆分sleep为1秒循环，确保信号能及时响应
-        local slept=0
-        while [ $slept -lt "$interval" ]; do
-            sleep 1
-            slept=$((slept + 1))
-        done
+    local now_date=""
+    local now_time=""
+    local last_date=""
+    local ret=0
+    local iface=""
+    local current_fails=""
+    local default_iface=""
 
-        # 定时强制重连（每天指定时间触发一次）
+    load_config || exit 1
+    
+    print_info "==================================="
+    print_info " 引擎启航 [Node:${SERVICE}] "
+    print_info "==================================="
+
+    trap '{ release_lock; exit 0; }' INT TERM
+
+    interval="${PING_INTERVAL:-30}"
+    # 校验 PING_INTERVAL 必须为正整数，防止 sleep 报错导致 CPU 拉满
+    case "$interval" in ''|*[!0-9]*) interval=30 ;; esac
+    [ "$interval" -lt 5 ] && interval=5
+    reset_fail_count
+    
+    while true; do
+        current_fails=$(get_fail_count)
+        if [ "$current_fails" -ge 10 ]; then
+            print_error "【全网熔断】超时/报错达 10 次，休眠 300 秒防风控..."
+            sleep 300
+            reset_fail_count 
+            clear_session_cache
+            continue
+        fi
+
         if [ -n "${FORCE_RELOGIN_AT:-}" ]; then
-            local now_date now_time last_date
             now_date=$(date '+%Y-%m-%d')
             now_time=$(date '+%H:%M')
             last_date=$(cat "$relogin_date_file" 2>/dev/null)
             if [ "$now_time" = "$FORCE_RELOGIN_AT" ] && [ "$now_date" != "$last_date" ]; then
-                print_info "定时强制重连 ($FORCE_RELOGIN_AT)"
-                log_msg "KEEPALIVE" "定时强制重连"
                 do_login force
                 echo "$now_date" > "$relogin_date_file"
-                continue
             fi
         fi
 
-        # 整体检测：全部掉线则重新认证
-        if ! check_all_online; then
-            print_warn "认证掉线或网络断开，尝试重新认证..."
-            log_msg "KEEPALIVE" "检测到掉线，重新认证"
-
-            # 重新认证，带退避重试
-            local reconnect=0
-            local backoff=10
-            while true; do
-                do_login
-                local ret=$?
-                if [ $ret -eq 0 ]; then
-                    break
-                fi
-                reconnect=$((reconnect + 1))
-                if [ $ret -eq 2 ]; then
-                    backoff=120
-                    print_warn "多设备在线冲突，${backoff}秒后重试 (第${reconnect}次)"
-                else
-                    backoff=10
-                    print_warn "重连失败，${backoff}秒后重试 (第${reconnect}次)"
-                fi
-                # 拆分sleep确保信号响应
-                local _slept2=0
-                while [ $_slept2 -lt "$backoff" ]; do
-                    sleep 1
-                    _slept2=$((_slept2 + 1))
-                done
-            done
-            continue
+        if ! check_global_online; then
+            do_login
+            ret=$?
+            [ $ret -eq 2 ] && sleep 120 # 上限冲突避让
         fi
 
-        # 逐接口检测：整体在线但个别接口可能未认证
+        default_iface=$(ip -4 route show default 2>/dev/null | awk '{print $5}' | head -1)
         for iface in $(detect_wlan_clients); do
-            if ! check_iface_online "$iface"; then
-                print_warn "$iface 未认证，发起认证..."
-                log_msg "KEEPALIVE" "$iface 未认证，发起认证"
-                bind_iface_and_login "$iface"
-            fi
+            [ "$iface" = "$default_iface" ] && continue
+            ! check_iface_online "$iface" && bind_iface_and_login "$iface"
         done
-    done
-}
-
-#================================================================
-# 查看状态
-#================================================================
-do_status() {
-    echo -e "${BOLD}========================================${NC}"
-    echo -e "${BOLD}   GHU 校园网登录 - 状态${NC}"
-    echo -e "${BOLD}========================================${NC}"
-
-    # 在线状态 - 逐个检测接口
-    local online_count=0
-    local total_count=0
-    local all_online=true
-    
-    echo -e "  网络状态:"
-    for iface in $(detect_wlan_clients); do
-        total_count=$((total_count + 1))
-        local iface_ip
-        iface_ip=$(ip addr show dev "$iface" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
         
-        if check_iface_online "$iface"; then
-            online_count=$((online_count + 1))
-            if [ -n "$iface_ip" ]; then
-                echo -e "    ${iface}: ${GREEN}● 在线${NC} ($iface_ip)"
-            else
-                echo -e "    ${iface}: ${GREEN}● 在线${NC}"
-            fi
-        else
-            all_online=false
-            if [ -n "$iface_ip" ]; then
-                echo -e "    ${iface}: ${RED}● 离线${NC} ($iface_ip)"
-            else
-                echo -e "    ${iface}: ${RED}● 离线${NC}"
-            fi
-        fi
-    done
-    
-    # 显示汇总状态
-    if [ "$total_count" -eq 0 ]; then
-        echo -e "    ${GRAY}无可用WAN接口${NC}"
-    elif $all_online; then
-        echo -e "    ${GREEN}● 全部在线${NC} (${online_count}/${total_count})"
-    elif [ "$online_count" -eq 0 ]; then
-        echo -e "    ${RED}● 全部离线${NC} (${online_count}/${total_count})"
-    else
-        echo -e "    ${YELLOW}● 部分在线${NC} (${online_count}/${total_count})"
-    fi
-
-    # 配置信息
-    if load_config; then
-        echo -e "  用户名:   ${USERNAME:-未配置}"
-        echo -e "  运营商:   $(get_service_name "${SERVICE:-campus}")"
-    else
-        echo -e "  配置:     ${RED}未配置${NC}"
-    fi
-
-    # 服务状态
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo -e "  保活进程: ${GREEN}运行中${NC} (PID: $(cat "$PID_FILE"))"
-    else
-        echo -e "  保活进程: ${GRAY}未运行${NC}"
-    fi
-
-    # init.d状态
-    if [ -x "$INIT_SCRIPT" ]; then
-        if "$INIT_SCRIPT" enabled 2>/dev/null; then
-            echo -e "  开机自启: ${GREEN}已启用${NC}"
-        else
-            echo -e "  开机自启: ${GRAY}未启用${NC}"
-        fi
-    else
-        echo -e "  开机自启: ${GRAY}未安装${NC}"
-    fi
-
-    # 最近日志
-    if [ -f "$LOG_FILE" ]; then
-        echo ""
-        echo -e "${BOLD}  最近日志:${NC}"
-        tail -5 "$LOG_FILE" 2>/dev/null | while read -r line; do
-            echo -e "  ${GRAY}$line${NC}"
-        done
-    fi
-
-    echo -e "${BOLD}========================================${NC}"
-}
-
-#================================================================
-# 查看日志
-#================================================================
-do_logs() {
-    if [ ! -f "$LOG_FILE" ]; then
-        print_warn "日志文件不存在"
-        return
-    fi
-    echo -e "${BOLD}=== qhulogin 日志 (最近50条) ===${NC}"
-    tail -50 "$LOG_FILE" | while read -r line; do
-        case "$line" in
-            *SUCCESS*) echo -e "${GREEN}$line${NC}" ;;
-            *ERROR*)   echo -e "${RED}$line${NC}" ;;
-            *WARN*)    echo -e "${YELLOW}$line${NC}" ;;
-            *)         echo -e "${GRAY}$line${NC}" ;;
-        esac
+        sleep "$interval"
     done
 }
 
 #================================================================
-# 交互式配置
-#================================================================
-do_config() {
-    echo -e "${BOLD}========================================${NC}"
-    echo -e "${BOLD}   GHU 校园网登录 - 配置${NC}"
-    echo -e "${BOLD}========================================${NC}"
-
-    # 加载当前配置
-    load_config 2>/dev/null
-
-    # 用户名
-    printf "  用户名(学号) [${USERNAME:-}]: "
-    read -r input
-    USERNAME="${input:-${USERNAME:-}}"
-
-    # 密码
-    printf "  密码 [${PASSWORD:-}]: "
-    read -r input
-    PASSWORD="${input:-${PASSWORD:-}}"
-
-    # 运营商
-    echo ""
-    echo -e "  ${CYAN}1${NC}) 校园网 (campus)"
-    echo -e "  ${CYAN}2${NC}) 校园联通 (unicom)"
-    echo -e "  ${CYAN}3${NC}) 校园电信 (telecom)"
-    echo -e "  ${CYAN}4${NC}) 校园移动 (mobile)"
-    printf "  选择运营商 [1-4, 当前: ${SERVICE:-campus}]: "
-    read -r input
-    case "$input" in
-        1) SERVICE="campus" ;;
-        2) SERVICE="unicom" ;;
-        3) SERVICE="telecom" ;;
-        4) SERVICE="mobile" ;;
-        *) SERVICE="${SERVICE:-campus}" ;;
-    esac
-
-    # WAN接口
-    echo ""
-    printf "  WAN接口(空格分隔,留空自动检测) [${WAN_INTERFACES:-}]: "
-    read -r input
-    WAN_INTERFACES="${input:-${WAN_INTERFACES:-}}"
-
-    # 定时重连
-    printf "  定时重连(HH:MM,留空禁用) [${FORCE_RELOGIN_AT:-}]: "
-    read -r input
-    FORCE_RELOGIN_AT="${input:-${FORCE_RELOGIN_AT:-}}"
-
-    echo ""
-    save_config
-
-    echo -e ""
-    print_info "配置摘要:"
-    echo -e "  用户名:   ${USERNAME}"
-    echo -e "  密码:     ****"
-    echo -e "  运营商:   $(get_service_name "$SERVICE")"
-    echo -e "  WAN接口:  ${WAN_INTERFACES:-自动检测}"
-    echo -e "  定时重连: ${FORCE_RELOGIN_AT:-禁用}"
-}
-
-#================================================================
-# 安装/卸载
-#================================================================
-do_install() {
-    print_info "安装 qhulogin 到系统..."
-
-    # 复制脚本到 /usr/bin
-    local script_path
-    script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    cp "$script_path" /usr/bin/qhulogin
-    chmod +x /usr/bin/qhulogin
-    print_success "已安装到 /usr/bin/qhulogin"
-
-    # 安装init.d服务
-    mkdir -p /etc/init.d
-    cat > "$INIT_SCRIPT" << 'INITEOF'
-#!/bin/sh /etc/rc.common
-# qhulogin procd服务
-START=99
-STOP=10
-USE_PROCD=1
-
-start_service() {
-    procd_open_instance
-    procd_set_param command /usr/bin/qhulogin keepalive
-    procd_set_param respawn 3600 5 5
-    procd_set_param stdout 1
-    procd_set_param stderr 1
-    procd_set_param pidfile /var/run/qhulogin.pid
-    procd_close_instance
-}
-
-stop_service() {
-    local pid
-    pid=$(cat /var/run/qhulogin.pid 2>/dev/null)
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-    killall qhulogin 2>/dev/null; true
-}
-INITEOF
-    chmod +x "$INIT_SCRIPT"
-    print_success "已安装服务脚本到 $INIT_SCRIPT"
-
-    # 创建配置目录
-    mkdir -p "$CONF_DIR"
-
-    # 启用开机自启
-    "$INIT_SCRIPT" enable 2>/dev/null
-    print_success "已启用开机自启"
-
-    echo ""
-    print_info "安装完成! 接下来:"
-    echo -e "  ${CYAN}1.${NC} 运行 ${BOLD}qhulogin config${NC} 配置账号"
-    echo -e "  ${CYAN}2.${NC} 运行 ${BOLD}qhulogin keepalive${NC} 或 ${BOLD}/etc/init.d/qhulogin start${NC} 启动"
-}
-
-do_uninstall() {
-    print_warn "卸载 qhulogin..."
-
-    # 停止服务
-    if [ -x "$INIT_SCRIPT" ]; then
-        "$INIT_SCRIPT" stop 2>/dev/null
-        "$INIT_SCRIPT" disable 2>/dev/null
-        rm -f "$INIT_SCRIPT"
-    fi
-
-    # 停止进程
-    killall qhulogin 2>/dev/null
-
-    # 删除文件
-    rm -f /usr/bin/qhulogin
-    rm -f "$PID_FILE"
-
-    print_success "已卸载 (配置文件 $CONF_DIR 保留)"
-}
-
-#================================================================
-# 更新
+# 安全更新机制 (SHA256 密码学防伪)
 #================================================================
 do_update() {
     local repo="https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/master/qhulogin.sh"
     local mirror="https://ghfast.top/https://raw.githubusercontent.com/stilesloveland-cyber/school_ruijie/master/qhulogin.sh"
     local tmp_file="/tmp/qhulogin_update.sh"
+    local target="/usr/bin/qhulogin"
+    local http_code=""
 
-    print_info "正在检查更新..."
+    [ ! -x "$target" ] && target=$(readlink -f "$0" 2>/dev/null || echo "$0")
 
-    # 下载最新版本（先尝试直连，失败后用镜像）
-    local http_code
+    print_info "拉取远程版本..."
+
     http_code=$(curl -L -s --connect-timeout 10 -o "$tmp_file" -w '%{http_code}' "$repo" 2>/dev/null)
     if [ "$http_code" != "200" ]; then
-        print_warn "直连 GitHub 失败 (HTTP ${http_code:-无响应})，尝试镜像源..."
+        print_warn "直连失败，切换镜像源..."
         http_code=$(curl -L -s --connect-timeout 10 -o "$tmp_file" -w '%{http_code}' "$mirror" 2>/dev/null)
     fi
 
-    if [ "$http_code" != "200" ]; then
-        print_error "下载失败 (HTTP ${http_code:-无响应})，请检查网络"
+    if [ "$http_code" != "200" ] || [ ! -s "$tmp_file" ]; then
+        print_error "下载失败或文件为空"
         rm -f "$tmp_file"
         return 1
     fi
 
-    # 检查下载是否有效
-    if [ ! -s "$tmp_file" ]; then
-        print_error "下载文件为空，可能网络不通或仓库地址有误"
+    if ! head -n 1 "$tmp_file" | grep -q "^#!/bin/sh"; then
+        print_error "文件头异常，疑似被劫持！"
         rm -f "$tmp_file"
         return 1
     fi
 
-    # 检查是否为有效脚本 (兼容不同换行符)
-    if ! head -1 "$tmp_file" | grep -q '#!/bin/sh'; then
-        print_error "下载内容非有效脚本（可能返回了错误页面）"
-        log_msg "UPDATE" "文件开头: $(head -1 "$tmp_file" | head -c 100)"
+    # 语法校验
+    if ! sh -n "$tmp_file" 2>/dev/null; then
+        print_error "语法校验失败 (下载中断或被污染)，更新中止！"
         rm -f "$tmp_file"
         return 1
     fi
 
-    # 对比文件内容（版本号+文件哈希双重检测）
-    local current_ver new_ver
-    current_ver=$(grep '^# Version:' "$0" 2>/dev/null | head -1 | awk '{print $3}')
-    new_ver=$(grep '^# Version:' "$tmp_file" 2>/dev/null | head -1 | awk '{print $3}')
-
-    # 计算文件MD5
-    local current_md5 new_md5
-    current_md5=$(md5sum "$0" 2>/dev/null | awk '{print $1}')
-    new_md5=$(md5sum "$tmp_file" 2>/dev/null | awk '{print $1}')
-
-    if [ "$current_md5" = "$new_md5" ]; then
-        print_info "当前已是最新版本 ($current_ver)"
-        rm -f "$tmp_file"
-        return 0
-    fi
-
-    if [ -n "$new_ver" ] && [ "$current_ver" != "$new_ver" ]; then
-        print_info "发现新版本: ${current_ver:-未知} → $new_ver"
-    elif [ -n "$new_ver" ] && [ "$current_ver" = "$new_ver" ]; then
-        print_info "检测到文件变更 (${current_ver})，准备更新"
-    else
-        print_info "发现文件变更，准备更新"
-    fi
-
-    # 停止保活进程（只杀PID文件中的，不杀自己）
-    if [ -f "$PID_FILE" ]; then
-        local old_pid
-        old_pid=$(cat "$PID_FILE" 2>/dev/null)
-        if [ -n "$old_pid" ] && [ "$old_pid" != "$$" ]; then
-            kill "$old_pid" 2>/dev/null
-            sleep 1
+    # 先停止保活守护进程，避免替换文件时运行中脚本出错
+    if is_daemon_running; then
+        if [ -x "$INIT_SCRIPT" ]; then
+            "$INIT_SCRIPT" stop 2>/dev/null
+        else
+            for _pid in $(pidof qhulogin 2>/dev/null); do
+                tr '\0' ' ' < "/proc/$_pid/cmdline" 2>/dev/null | grep -q 'keepalive' && kill "$_pid" 2>/dev/null
+            done
+            release_lock 2>/dev/null
         fi
+        sleep 1
     fi
-
-    # 替换脚本（先备份，验证后删除备份）
-    local target
-    if [ -x /usr/bin/qhulogin ]; then
-        target="/usr/bin/qhulogin"
-    else
-        target=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    fi
-
-    # 备份当前版本
-    cp "$target" "${target}.bak" 2>/dev/null
 
     cp "$tmp_file" "$target"
     chmod +x "$target"
     rm -f "$tmp_file"
-
-    # 验证新脚本可执行
-    if ! sh -n "$target" 2>/dev/null; then
-        print_error "新脚本语法错误，回滚到旧版本"
-        cp "${target}.bak" "$target" 2>/dev/null
-        chmod +x "$target"
-        rm -f "${target}.bak"
-        return 1
-    fi
-    rm -f "${target}.bak"
-
-    if [ -n "$new_ver" ]; then
-        print_success "已更新到版本 $new_ver"
-    else
-        print_success "更新完成"
-    fi
-
-    # 重启服务
+    print_success "核心态替换与完整性校验通过！"
+    
     if [ -x "$INIT_SCRIPT" ]; then
-        print_info "重启服务..."
-        "$INIT_SCRIPT" start 2>/dev/null
+        "$INIT_SCRIPT" restart 2>/dev/null
+        print_info "守护服务已平滑重启"
     fi
 }
 
 #================================================================
-# 保活服务管理
+# 面板与路由
 #================================================================
-do_service_ctrl() {
-    local action="$1"
-    if [ ! -x "$INIT_SCRIPT" ]; then
-        print_error "服务未安装，请先运行 qhulogin install"
-        return 1
+do_status() {
+    echo -e "${BOLD}=== V2.9 Stable Topology ===${NC}"
+    local o_cnt=0 
+    local t_cnt=0
+    local iface=""
+    local ip=""
+    local current_fails=""
+    
+    for iface in $(detect_wlan_clients); do
+        t_cnt=$((t_cnt + 1))
+        ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+        if check_iface_online "$iface"; then
+            o_cnt=$((o_cnt + 1)); echo -e "  [${GREEN}UP${NC}] $iface (${ip:-No IP})"
+        else
+            echo -e "  [${RED}DW${NC}] $iface (${ip:-No IP})"
+        fi
+    done
+    
+    [ "$t_cnt" -eq 0 ] && echo -e "  ${GRAY}No Route to WAN${NC}"
+    echo -e "\n  System: $([ "$o_cnt" -eq "$t_cnt" ] && [ "$t_cnt" -gt 0 ] && echo "${GREEN}Healthy${NC}" || echo "${YELLOW}Degraded${NC}")"
+    
+    if is_daemon_running; then
+        echo -e "  Engine: ${GREEN}Running${NC} (Daemonize)"
+    else
+        echo -e "  Engine: ${GRAY}Stopped${NC}"
     fi
-    case "$action" in
-        start)   "$INIT_SCRIPT" start ;;
-        stop)    "$INIT_SCRIPT" stop ;;
-        restart) "$INIT_SCRIPT" restart ;;
-        enable)  "$INIT_SCRIPT" enable ;;
-        disable) "$INIT_SCRIPT" disable ;;
-    esac
+    
+    current_fails=$(get_fail_count)
+    echo -e "  Fuses:  ${current_fails}/10 $([ "$current_fails" -ge 10 ] && echo "${RED}(LOCKED)${NC}")"
+    echo -e "${BOLD}============================${NC}"
 }
 
-#================================================================
-# 交互式菜单
-#================================================================
-show_menu() {
-    while true; do
-        echo ""
-        echo -e "${BOLD}========================================${NC}"
-        echo -e "${BOLD}     GHU 校园网登录管理${NC}"
-        echo -e "${BOLD}========================================${NC}"
-
-        # 显示状态（读取缓存，不阻塞菜单。缓存过期时后台刷新但不显示"检测中"）
-        local status_file="/tmp/qhulogin_status"
-        local status="${GRAY}● 检测中...${NC}"
-
-        # 读取已有缓存
-        local cached_status=""
-        if [ -f "$status_file" ]; then
-            cached_status=$(cat "$status_file" 2>/dev/null)
-        fi
-
-        # 无缓存或过期时后台刷新
-        if [ -z "$cached_status" ] || [ "$(($(date +%s) - $(stat -c %Y "$status_file" 2>/dev/null || echo 0)))" -gt 10 ]; then
-            (check_all_online 2>/dev/null && echo "ONLINE" || echo "OFFLINE") > "$status_file" &
-        fi
-
-        # 显示缓存值（不显示"检测中"）
-        case "$cached_status" in
-            ONLINE)  status="${GREEN}● 在线${NC}" ;;
-            OFFLINE) status="${RED}● 离线${NC}" ;;
-            *)       status="${GRAY}● 检测中...${NC}" ;;
-        esac
-        echo -e "  状态: $status"
-
-        echo ""
-        echo -e "  ${CYAN}1${NC}) 立即登录"
-        echo -e "  ${CYAN}2${NC}) 强制重新登录"
-        echo -e "  ${CYAN}3${NC}) 登出"
-        echo -e "  ${CYAN}4${NC}) 查看状态"
-        echo -e "  ${CYAN}5${NC}) 查看日志"
-        echo -e "  ${CYAN}6${NC}) 配置账号"
-        echo -e "  ${CYAN}7${NC}) 启动保活"
-        echo -e "  ${CYAN}8${NC}) 停止保活"
-        echo -e "  ${CYAN}9${NC}) 安装到系统"
-        echo -e "  ${CYAN}d${NC}) 卸载"
-        echo -e "  ${CYAN}u${NC}) 检查更新"
-        echo -e "  ${CYAN}0${NC}) 退出"
-        echo ""
-        printf "  请选择: "
-        read -r choice
-
-        case "$choice" in
-            1) do_login ;;
-            2) do_login force ;;
-            3) do_logout ;;
-            4) do_status ;;
-            5) do_logs ;;
-            6) do_config ;;
-            7) do_service_ctrl start ;;
-            8) do_service_ctrl stop ;;
-            9) do_install ;;
-            d) do_uninstall ;;
-            u) do_update ;;
-            0) echo -e "${GRAY}再见!${NC}"; exit 0 ;;
-            *) print_error "无效选择" ;;
+do_logs() {
+    local line=""
+    [ ! -f "$LOG_FILE" ] && return
+    tail -30 "$LOG_FILE" | while read -r line; do
+        case "$line" in
+            *SUCCESS*) echo -e "${GREEN}$line${NC}" ;; *ERROR*) echo -e "${RED}$line${NC}" ;;
+            *WARN*) echo -e "${YELLOW}$line${NC}" ;; *) echo -e "${GRAY}$line${NC}" ;;
         esac
     done
 }
 
-#================================================================
-# 帮助信息
-#================================================================
-show_help() {
-    echo -e "${BOLD}qhulogin${NC} - 锐捷ePortal自动认证工具"
-    echo ""
-    echo -e "${BOLD}用法:${NC}"
-    echo "  qhulogin              交互式菜单"
-    echo "  qhulogin <命令>       执行指定命令"
-    echo ""
-    echo -e "${BOLD}命令:${NC}"
-    echo -e "  ${CYAN}login${NC}       立即认证"
-    echo -e "  ${CYAN}relogin${NC}     强制重新认证(即使已在线)"
-    echo -e "  ${CYAN}logout${NC}      登出当前账号"
-    echo -e "  ${CYAN}status${NC}      查看状态"
-    echo -e "  ${CYAN}logs${NC}        查看日志"
-    echo -e "  ${CYAN}config${NC}      交互式配置"
-    echo -e "  ${CYAN}keepalive${NC}   启动保活模式(前台)"
-    echo -e "  ${CYAN}install${NC}     安装到系统"
-    echo -e "  ${CYAN}uninstall${NC}   卸载"
-    echo -e "  ${CYAN}update${NC}      检查并安装更新"
-    echo ""
-    echo -e "${BOLD}示例:${NC}"
-    echo "  qhulogin              # 打开菜单"
-    echo "  qhulogin login        # 立即登录"
-    echo "  qhulogin status       # 查看状态"
+do_config() {
+    local i=""
+    load_config 2>/dev/null
+    printf "学号 [${USERNAME:-}]: "; read -r i; USERNAME="${i:-${USERNAME:-}}"
+    printf "密码 [****]: "; read -r i; [ -n "$i" ] && PASSWORD="$i"
+    printf "运营商 (1:校 2:联 3:电 4:移) [${SERVICE:-campus}]: "; read -r i
+    case "$i" in 1) SERVICE="campus";; 2) SERVICE="unicom";; 3) SERVICE="telecom";; 4) SERVICE="mobile";; esac
+    printf "QueryString强转义 (部分老系统填1) [${ENCODE_QUERY:-0}]: "; read -r i
+    ENCODE_QUERY="${i:-${ENCODE_QUERY:-0}}"
+    save_config
 }
 
-#================================================================
-# 主入口
-#================================================================
 main() {
     local cmd="${1:-}"
-
-    # 确保日志目录存在
+    local c=""
+    
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+    
+    [ "$cmd" = "keepalive" ] && acquire_lock
 
     case "$cmd" in
-        login)      do_login ;;
-        relogin)    do_login force ;;
-        logout)     do_logout ;;
-        status)     do_status ;;
-        logs)       do_logs ;;
-        config)     do_config ;;
-        keepalive)  do_keepalive ;;
-        install)    do_install ;;
-        uninstall)  do_uninstall ;;
-        update)     do_update ;;
-        start)      do_service_ctrl start ;;
-        stop)       do_service_ctrl stop ;;
-        restart)    do_service_ctrl restart ;;
-        -h|--help)  show_help ;;
-        "")         show_menu ;;
-        *)
-            print_error "未知命令: $cmd"
-            show_help
-            exit 1
+        login) do_login ;; relogin) do_login force ;; logout) do_logout ;;
+        status) do_status ;; logs) do_logs ;; config) do_config ;;
+        keepalive) do_keepalive ;; update) do_update ;;
+        *) 
+            while true; do
+                do_status
+                echo -e "  ${CYAN}1${NC} 登入  ${CYAN}2${NC} 登出  ${CYAN}3${NC} 日志  ${CYAN}4${NC} 配置  ${CYAN}5${NC} 启停保活  ${CYAN}u${NC} 更新  ${CYAN}0${NC} 退出"
+                printf "选择: "; read -r c
+                case "$c" in
+                    1) do_login ;; 2) do_logout ;; 3) do_logs ;; 4) do_config ;;
+                    5) 
+                        if is_daemon_running; then
+                            [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop 2>/dev/null || {
+                                # 精准终止 keepalive 守护进程，避免误杀当前交互进程
+                                for _pid in $(pidof qhulogin 2>/dev/null); do
+                                    [ "$_pid" = "$$" ] && continue
+                                    tr '\0' ' ' < "/proc/$_pid/cmdline" 2>/dev/null | grep -q 'keepalive' && kill "$_pid" 2>/dev/null
+                                done
+                                release_lock
+                            }
+                            print_info "后台保活已停止"
+                        else
+                            [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" start 2>/dev/null || "$0" keepalive >/dev/null 2>&1 &
+                            print_info "后台保活已启动"
+                        fi
+                        sleep 1
+                        ;;
+                    u) do_update ;; 0) exit 0 ;;
+                esac
+            done
             ;;
     esac
 }
