@@ -406,7 +406,7 @@ rsa_encrypt_password() {
 }
 
 #================================================================
-# 核心认证引擎
+# 核心认证引擎 (硬编码 ePortal 参数，仅从 302 获取 queryString)
 #================================================================
 do_login() {
     local force="${1:-}"
@@ -415,7 +415,6 @@ do_login() {
     local ip_tag=""
     local login_page_url=""
     local eportal_ip=""
-    local login_url=""
     local query_string=""
     local login_html=""
     local rsa_key=""
@@ -462,22 +461,10 @@ do_login() {
     my_ip=$(ip -4 addr show dev "$my_iface" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
     ip_tag=" [${my_iface:-未知}:${my_ip:-无IP}]"
 
-    if [ "$force" != "force" ] && check_global_online; then
-        print_success "全局主接口已在线"
-        reset_fail_count
-        return 0
-    fi
+    # 硬编码 ePortal IP（210.27.177.172），EPORTAL_IP 配置可覆盖
+    eportal_ip="${EPORTAL_IP:-210.27.177.172}"
 
-    # 每接口独立获取 login_page_url（含当前接口的 wlanuserip）
-    # 不使用缓存，避免跨接口 wlanuserip 污染
-    eportal_ip=$(discover_eportal_ip)
-    if [ -z "$eportal_ip" ]; then
-        print_error "ePortal IP 未发现 (尝试配置 EPORTAL_IP)"
-        inc_fail_count
-        return 1
-    fi
-
-    # 通过根路径 / 获取 302 重定向（含当前接口的 wlanuserip）
+    # 仅从根路径 302 获取 queryString（含加密的 wlanuserip，每接口不同）
     login_page_url=$(probe_eportal_root "$eportal_ip" "$my_iface")
     local probe_ret=$?
     if [ $probe_ret -eq 2 ] && [ "$force" != "force" ]; then
@@ -490,9 +477,6 @@ do_login() {
         return 1
     fi
 
-    login_url=$(echo "$login_page_url" | awk -F '?' '{print $1}')
-    login_url="${login_url/index.jsp/InterFace.do?method=login}"
-
     query_string=$(echo "$login_page_url" | awk -F '?' '{print $2}')
     # 兼容开关：部分老式锐捷需要深度 Encode
     if [ "${ENCODE_QUERY:-0}" = "1" ]; then
@@ -500,7 +484,19 @@ do_login() {
         query_string="${query_string//=/%253D}"
     fi
 
-    login_html=$(run_curl -s -m 5 "$login_page_url")
+    # 从登录页获取 RSA 公钥
+    local login_page_ip_url=""
+    login_page_ip_url=$(echo "$login_page_url" | sed -n 's|.*://\([^/]*\).*|http://'"${eportal_ip}"'/&|p' | head -1)
+    [ -z "$login_page_ip_url" ] && login_page_ip_url="http://${eportal_ip}/eportal/index.jsp"
+    # 替换 URL 中的域名为 IP
+    local url_host=""
+    url_host=$(echo "$login_page_url" | sed -n 's|.*://\([^/]*\).*|\1|p' | head -1)
+    if [ -n "$url_host" ] && [ "$url_host" != "$eportal_ip" ]; then
+        login_page_ip_url=$(echo "$login_page_url" | sed "s|${url_host}|${eportal_ip}|")
+    else
+        login_page_ip_url="$login_page_url"
+    fi
+    login_html=$(run_curl -s -m 5 "$login_page_ip_url")
     rsa_key=$(echo "$login_html" | grep -oiE 'publickey[^a-zA-Z0-9]+[a-zA-Z0-9+/=]{60,}' | grep -oE '[a-zA-Z0-9+/=]{60,}' | head -1)
 
     encrypted_password="$PASSWORD"
@@ -512,12 +508,13 @@ do_login() {
         fi
     fi
 
+    # 硬编码登录 URL（不再从 login_page_url 拼接）
     service_string=$(get_service_string "${SERVICE:-campus}")
     result=$(run_curl -s -m 15 \
         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/149.0.0.0 Safari/537.36" \
         -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
         -d "userId=${USERNAME}&password=${encrypted_password}&service=${service_string}&queryString=${query_string}&operatorPwd=&operatorUserId=&validcode=&passwordEncrypt=${password_encrypt}" \
-        "$login_url")
+        "http://${eportal_ip}/eportal/InterFace.do?method=login")
 
     # 严密判定，屏蔽 {"success":false} 误伤
     if echo "$result" | grep -qE '"success"[[:space:]]*:[[:space:]]*true|"result"[[:space:]]*:[[:space:]]*"(1|success)"'; then
