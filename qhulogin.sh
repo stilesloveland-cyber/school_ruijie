@@ -290,8 +290,8 @@ discover_eportal_ip() {
 
 #================================================================
 # ePortal 根路径 302 探测 (获取含 wlanuserip 的登录URL)
-# 青海大学 ePortal: 根路径 / → 302 跳转登录页（含 wlanuserip）
-#                   /eportal/index.jsp → 空响应（不可用）
+# 未认证: 302 → index.jsp?wlanuserip=...（登录页）
+# 已在线: 302 → redirectortosuccess.jsp（成功页）
 #================================================================
 probe_eportal_root() {
     local eportal_ip="$1"
@@ -308,6 +308,11 @@ probe_eportal_root() {
     LOGIN_INTERFACE="$saved_login_iface"
 
     if [ -n "$location" ]; then
+        # 已在线：重定向到成功页，不需要认证
+        if echo "$location" | grep -q "redirectortosuccess"; then
+            return 2
+        fi
+        # 未认证：重定向到登录页，替换域名为 IP（绕过 FakeIP）
         local url_host=""
         url_host=$(echo "$location" | sed -n 's|.*://\([^/]*\).*|\1|p' | head -1)
         if [ -n "$url_host" ] && [ "$url_host" != "$eportal_ip" ]; then
@@ -323,7 +328,7 @@ check_iface_online() {
     local iface="$1"
     local iface_ip=""
     local eportal_ip=""
-    local http_code=""
+    local info_resp=""
 
     # 无IP不测
     iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
@@ -331,10 +336,9 @@ check_iface_online() {
 
     load_config 2>/dev/null
 
-    # 核心检测：访问 ePortal 根路径 / 检查 HTTP 状态码
-    # 302 = 未认证（重定向到登录页）
-    # 200/其他 = 已认证（ePortal 不再重定向）
-    # 无 ePortal IP 则无法检测
+    # 通过 Portal API 判断在线状态（IP 直连，绕过 FakeIP）
+    # 已在线: userIndex 有值（非 null/空）
+    # 未认证: userIndex:null 或 result:fail
     eportal_ip=$(discover_eportal_ip)
     if [ -z "$eportal_ip" ]; then
         return 1
@@ -342,14 +346,14 @@ check_iface_online() {
 
     local saved_login_iface="${LOGIN_INTERFACE:-}"
     LOGIN_INTERFACE="$iface"
-    http_code=$(run_curl -s -I -m 3 -o /dev/null -w '%{http_code}' "http://${eportal_ip}/" 2>/dev/null)
+    info_resp=$(run_curl -s -m 3 -d "userId=${USERNAME}" "http://${eportal_ip}/eportal/InterFace.do?method=getOnlineUserInfo")
     LOGIN_INTERFACE="$saved_login_iface"
 
-    # 302 = 未认证，非302 = 已认证
-    if [ "$http_code" = "302" ]; then
-        return 1
+    # userIndex 有值 = 已在线
+    if echo "$info_resp" | grep -qE '"userIndex"[[:space:]]*:[[:space:]]*"[^",}]+'; then
+        return 0
     fi
-    if [ -n "$http_code" ] && [ "$http_code" != "000" ]; then
+    if echo "$info_resp" | grep -qE '"userIndex"[[:space:]]*:[[:space:]]*[1-9][0-9]*'; then
         return 0
     fi
 
@@ -475,8 +479,13 @@ do_login() {
 
     # 通过根路径 / 获取 302 重定向（含当前接口的 wlanuserip）
     login_page_url=$(probe_eportal_root "$eportal_ip" "$my_iface")
-    if [ -z "$login_page_url" ]; then
-        print_error "ePortal 根路径无 302 响应 (可能已在线或 ePortal 异常)"
+    local probe_ret=$?
+    if [ $probe_ret -eq 2 ]; then
+        print_success "[$ip_tag] 已在线（redirectortosuccess），跳过认证"
+        return 0
+    fi
+    if [ $probe_ret -ne 0 ] || [ -z "$login_page_url" ]; then
+        print_error "[$ip_tag] ePortal 根路径无 302 响应 (ePortal 异常)"
         inc_fail_count
         return 1
     fi
