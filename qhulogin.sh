@@ -668,14 +668,7 @@ do_update() {
         return 1
     fi
 
-    # 语法校验
-    if ! sh -n "$tmp_file" 2>/dev/null; then
-        print_error "语法校验失败 (下载中断或被污染)，更新中止！"
-        rm -f "$tmp_file"
-        return 1
-    fi
-
-    # 先停止保活守护进程，避免替换文件时运行中脚本出错
+    # 停止保活守护进程
     if is_daemon_running; then
         if [ -x "$INIT_SCRIPT" ]; then
             "$INIT_SCRIPT" stop 2>/dev/null
@@ -691,11 +684,11 @@ do_update() {
     cp "$tmp_file" "$target"
     chmod +x "$target"
     rm -f "$tmp_file"
-    print_success "核心态替换与完整性校验通过！"
+    print_success "更新完成！"
     
     if [ -x "$INIT_SCRIPT" ]; then
         "$INIT_SCRIPT" restart 2>/dev/null
-        print_info "守护服务已平滑重启"
+        print_info "守护服务已重启"
     fi
 }
 
