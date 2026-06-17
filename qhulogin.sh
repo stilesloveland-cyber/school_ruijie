@@ -480,7 +480,7 @@ do_login() {
     # 通过根路径 / 获取 302 重定向（含当前接口的 wlanuserip）
     login_page_url=$(probe_eportal_root "$eportal_ip" "$my_iface")
     local probe_ret=$?
-    if [ $probe_ret -eq 2 ]; then
+    if [ $probe_ret -eq 2 ] && [ "$force" != "force" ]; then
         print_success "[$ip_tag] 已在线（redirectortosuccess），跳过认证"
         return 0
     fi
