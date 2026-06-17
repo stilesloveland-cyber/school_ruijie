@@ -26,7 +26,6 @@ readonly LOCK_FILE="/var/run/qhulogin.lock"
 readonly INIT_SCRIPT="/etc/init.d/qhulogin"
 readonly CACHE_FILE="${CONF_DIR}/.login_cache"
 readonly FAIL_COUNT_FILE="/tmp/qhulogin_fail_count"
-readonly PROBE_URLS="http://www.google.cn/generate_204 http://connect.rom.miui.com/generate_204 http://captive.apple.com/hotspot-detect.html"
 
 export LOCK_TYPE=""
 
@@ -135,6 +134,7 @@ load_config() {
     WAN_INTERFACES=$(safe_get "WAN_INTERFACES" "$CONF_FILE")
     FORCE_RELOGIN_AT=$(safe_get "FORCE_RELOGIN_AT" "$CONF_FILE")
     ENCODE_QUERY=$(safe_get "ENCODE_QUERY" "$CONF_FILE")
+    EPORTAL_IP=$(safe_get "EPORTAL_IP" "$CONF_FILE")
     
     [ -z "$PING_INTERVAL" ] && PING_INTERVAL="30"
     [ -z "$SERVICE" ] && SERVICE="campus"
@@ -152,46 +152,42 @@ PING_INTERVAL=$(shell_escape "${PING_INTERVAL:-30}")
 WAN_INTERFACES=$(shell_escape "${WAN_INTERFACES:-}")
 FORCE_RELOGIN_AT=$(shell_escape "${FORCE_RELOGIN_AT:-}")
 ENCODE_QUERY=$(shell_escape "${ENCODE_QUERY:-0}")
+EPORTAL_IP=$(shell_escape "${EPORTAL_IP:-}")
 EOF
     chmod 600 "$CONF_FILE"
 }
 
 load_cache() { 
     [ ! -f "$CACHE_FILE" ] && return
-    CACHE_EPORTAL_HOST=$(safe_get "CACHE_EPORTAL_HOST" "$CACHE_FILE")
-    CACHE_LOGIN_URL=$(safe_get "CACHE_LOGIN_URL" "$CACHE_FILE")
-    CACHE_QUERY_STRING=$(safe_get "CACHE_QUERY_STRING" "$CACHE_FILE")
+    CACHE_EPORTAL_IP=$(safe_get "CACHE_EPORTAL_IP" "$CACHE_FILE")
     CACHE_TIMESTAMP=$(safe_get "CACHE_TIMESTAMP" "$CACHE_FILE")
     # 缓存超过300秒强制过期
     local now_sec=$(date +%s)
     if [ -n "${CACHE_TIMESTAMP:-}" ] && [ $((now_sec - ${CACHE_TIMESTAMP:-0})) -gt 300 ]; then
-        CACHE_EPORTAL_HOST=""
-        CACHE_LOGIN_URL=""
-        CACHE_QUERY_STRING=""
+        CACHE_EPORTAL_IP=""
     fi
 }
 
 save_cache() {
     mkdir -p "$CONF_DIR" 2>/dev/null
     cat > "$CACHE_FILE" << EOF
-CACHE_EPORTAL_HOST=$(shell_escape "${CACHE_EPORTAL_HOST:-}")
-CACHE_LOGIN_URL=$(shell_escape "${CACHE_LOGIN_URL:-}")
-CACHE_QUERY_STRING=$(shell_escape "${CACHE_QUERY_STRING:-}")
+CACHE_EPORTAL_IP=$(shell_escape "${CACHE_EPORTAL_IP:-}")
 CACHE_TIMESTAMP=$(date +%s)
 EOF
 }
 
 clear_session_cache() {
-    unset CACHE_LOGIN_URL CACHE_QUERY_STRING 2>/dev/null || true
+    # 仅清除 ePortal IP 缓存（强制下次重新发现）
+    CACHE_EPORTAL_IP=""
     save_cache
 }
 
 get_service_string() {
     case "$1" in
-        unicom)  echo "%25E6%25A0%25A1%25E5%259B%25AD%25E8%2581%2594%25E9%2580%259A" ;;
-        telecom) echo "%25E6%25A0%25A1%25E5%259B%25AD%25E7%2594%25B5%25E4%25BF%25A1" ;;
-        mobile)  echo "%25E6%25A0%25A1%25E5%259B%25AD%25E7%25A7%25BB%25E5%258A%25A8" ;;
-        *)       echo "%25E6%25A0%25A1%25E5%259B%25AD%25E7%25BD%2591" ;;
+        unicom)  echo "%E6%A0%A1%E5%9B%AD%E8%81%94%E9%80%9A" ;;
+        telecom) echo "%E6%A0%A1%E5%9B%AD%E7%94%B5%E4%BF%A1" ;;
+        mobile)  echo "%E6%A0%A1%E5%9B%AD%E7%A7%BB%E5%8A%A8" ;;
+        *)       echo "%E6%A0%A1%E5%9B%AD%E7%BD%91" ;;
     esac
 }
 
@@ -258,86 +254,110 @@ detect_wlan_clients() {
 }
 
 #================================================================
-# API置顶 与 三体探针探测
+# ePortal IP 发现 (全链路 IP 直连，绕过 FakeIP DNS 劫持)
 #================================================================
-discover_eportal_host() {
-    local location=""
-    local url=""
-    local host=""
-    local gw_resp=""
+discover_eportal_ip() {
+    # 0. 优先使用用户手动配置的 EPORTAL_IP
+    load_config 2>/dev/null
+    [ -n "${EPORTAL_IP:-}" ] && { echo "$EPORTAL_IP"; return; }
 
+    # 1. 使用缓存的 IP
     load_cache
-    [ -n "${CACHE_EPORTAL_HOST:-}" ] && { echo "$CACHE_EPORTAL_HOST"; return; }
+    [ -n "${CACHE_EPORTAL_IP:-}" ] && { echo "$CACHE_EPORTAL_IP"; return; }
 
-    for url in $PROBE_URLS; do
-        location=$(run_curl -s -I -m 3 -L -o /dev/null -w '%{redirect_url}' "$url" 2>/dev/null)
-        
-        if [ -z "$location" ]; then
-            gw_resp=$(run_curl -s -m 3 "$url")
-            location=$(echo "$gw_resp" | grep -oE "href='[^']+'" | head -1 | sed "s/href='//;s/'//")
-            [ -z "$location" ] && location=$(echo "$gw_resp" | grep -oE 'href="[^"]+"' | head -1 | sed 's/href="//;s/"//')
-            [ -z "$location" ] && location=$(echo "$gw_resp" | grep -oE "location\.href='[^']+'" | head -1 | sed "s/location\.href='//;s/'//")
-            [ -z "$location" ] && location=$(echo "$gw_resp" | grep -oE 'window\.location="[^"]+"' | head -1 | sed 's/window\.location="//;s/"//')
-            [ -z "$location" ] && location=$(echo "$gw_resp" | grep -oiE 'url=[^"]+' | head -1 | sed 's/[Uu][Rr][Ll]=//')
+    # 2. 通过网关 DNS 反查 ePortal 域名（未认证时网关 DNS 可用）
+    local gw_dns=""
+    gw_dns=$(ip -4 route show default 2>/dev/null | awk '{print $3}' | head -1)
+
+    local candidate=""
+    local ip=""
+    for candidate in "eportal.qhu.edu.cn" "eportal" "210.27.177.172"; do
+        if echo "$candidate" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
+            ip="$candidate"
+        else
+            [ -n "$gw_dns" ] && ip=$(nslookup "$candidate" "$gw_dns" 2>/dev/null | grep -A1 'Name:' | grep 'Address' | awk '{print $2}' | head -1)
+            [ -z "$ip" ] && ip=$(nslookup "$candidate" 2>/dev/null | grep -A1 'Name:' | grep 'Address' | awk '{print $2}' | head -1)
         fi
-        
-        [ -n "$location" ] && break
+        [ -n "$ip" ] && break
     done
 
-    if [ -n "$location" ]; then
-        host=$(echo "$location" | sed -n 's|.*://\([^/]*\).*|\1|p' | head -1)
-        if [ -n "$host" ]; then
-            CACHE_EPORTAL_HOST="$host"
-            save_cache
-            echo "$host"
-        fi
+    if [ -n "$ip" ]; then
+        CACHE_EPORTAL_IP="$ip"
+        save_cache
+        echo "$ip"
     fi
+}
+
+#================================================================
+# ePortal 根路径 302 探测 (获取含 wlanuserip 的登录URL)
+# 青海大学 ePortal: 根路径 / → 302 跳转登录页（含 wlanuserip）
+#                   /eportal/index.jsp → 空响应（不可用）
+#================================================================
+probe_eportal_root() {
+    local eportal_ip="$1"
+    local iface="${2:-}"
+    local saved_login_iface="${LOGIN_INTERFACE:-}"
+
+    [ -z "$eportal_ip" ] && return 1
+
+    [ -n "$iface" ] && LOGIN_INTERFACE="$iface"
+
+    local location=""
+    location=$(run_curl -s -I -m 3 -o /dev/null -w '%{redirect_url}' "http://${eportal_ip}/" 2>/dev/null)
+
+    LOGIN_INTERFACE="$saved_login_iface"
+
+    if [ -n "$location" ]; then
+        local url_host=""
+        url_host=$(echo "$location" | sed -n 's|.*://\([^/]*\).*|\1|p' | head -1)
+        if [ -n "$url_host" ] && [ "$url_host" != "$eportal_ip" ]; then
+            location=$(echo "$location" | sed "s|${url_host}|${eportal_ip}|")
+        fi
+        echo "$location"
+        return 0
+    fi
+    return 1
 }
 
 check_iface_online() {
     local iface="$1"
-    local url=""
-    local code=""
     local iface_ip=""
-    local saved_login_iface="${LOGIN_INTERFACE:-}"
+    local eportal_ip=""
+    local http_code=""
 
     # 无IP不测
     iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
     [ -z "$iface_ip" ] && return 1
 
-    # 1. 优先调用 Portal API
-    load_cache
     load_config 2>/dev/null
-    if [ -n "${USERNAME:-}" ] && [ -n "${CACHE_EPORTAL_HOST:-}" ]; then
-        local info_resp
-        LOGIN_INTERFACE="$iface"
-        info_resp=$(run_curl -s -m 3 -d "userId=${USERNAME}" "http://${CACHE_EPORTAL_HOST}/eportal/InterFace.do?method=getOnlineUserInfo")
-        LOGIN_INTERFACE="$saved_login_iface"
-        # 兼容整型与字符串 userIndex（排除 null 和空值）
-        if echo "$info_resp" | grep -qE '"userIndex"[[:space:]]*:[[:space:]]*"[^",}]+'; then
-            return 0
-        fi
-        if echo "$info_resp" | grep -qE '"userIndex"[[:space:]]*:[[:space:]]*[1-9][0-9]*'; then
-            return 0
-        fi
+
+    # 核心检测：访问 ePortal 根路径 / 检查 HTTP 状态码
+    # 302 = 未认证（重定向到登录页）
+    # 200/其他 = 已认证（ePortal 不再重定向）
+    # 无 ePortal IP 则无法检测
+    eportal_ip=$(discover_eportal_ip)
+    if [ -z "$eportal_ip" ]; then
+        return 1
     fi
 
-    # 2. 探针 fallback
-    for url in $PROBE_URLS; do
-        LOGIN_INTERFACE="$iface"
-        code=$(run_curl -s -I -m 3 -o /dev/null -w '%{http_code}' "$url")
-        LOGIN_INTERFACE="$saved_login_iface"
-        [ "$code" = "204" ] && return 0
-        [ "$code" = "200" ] && echo "$url" | grep -q "apple" && return 0
-    done
+    local saved_login_iface="${LOGIN_INTERFACE:-}"
+    LOGIN_INTERFACE="$iface"
+    http_code=$(run_curl -s -I -m 3 -o /dev/null -w '%{http_code}' "http://${eportal_ip}/" 2>/dev/null)
+    LOGIN_INTERFACE="$saved_login_iface"
+
+    # 302 = 未认证，非302 = 已认证
+    if [ "$http_code" = "302" ]; then
+        return 1
+    fi
+    if [ -n "$http_code" ] && [ "$http_code" != "000" ]; then
+        return 0
+    fi
 
     return 1
 }
 
 # 全局连通性仅检测主路由，防链路风暴
 check_global_online() {
-    local eportal_host=""
-    local info_resp=""
     local default_iface=""
 
     load_config 2>/dev/null
@@ -390,8 +410,7 @@ do_login() {
     local my_ip=""
     local ip_tag=""
     local login_page_url=""
-    local eportal_host=""
-    local gw_resp=""
+    local eportal_ip=""
     local login_url=""
     local query_string=""
     local login_html=""
@@ -410,24 +429,28 @@ do_login() {
         return 1
     fi
 
-    # 10次轻量熔断防爆 (带超时自恢复)
-    current_fails=$(get_fail_count)
-    if [ "$current_fails" -ge 10 ]; then
-        local fuse_time_file="/tmp/qhulogin_fuse_time"
-        local now_sec=$(date +%s)
-        local fuse_sec=$(cat "$fuse_time_file" 2>/dev/null || echo "0")
-        # 首次熔断记录时间
-        [ "$fuse_sec" = "0" ] && { echo "$now_sec" > "$fuse_time_file"; fuse_sec="$now_sec"; }
-        # 超过300秒自动解除断路器
-        if [ $((now_sec - fuse_sec)) -ge 300 ]; then
-            print_warn "熔断超时 300 秒，自动重置"
-            reset_fail_count
-            rm -f "$fuse_time_file"
+    # 10次轻量熔断防爆 (带超时自恢复) — force 模式跳过熔断器
+    if [ "$force" != "force" ]; then
+        current_fails=$(get_fail_count)
+        if [ "$current_fails" -ge 10 ]; then
+            local fuse_time_file="/tmp/qhulogin_fuse_time"
+            local now_sec=$(date +%s)
+            local fuse_sec=$(cat "$fuse_time_file" 2>/dev/null || echo "0")
+            [ "$fuse_sec" = "0" ] && { echo "$now_sec" > "$fuse_time_file"; fuse_sec="$now_sec"; }
+            if [ $((now_sec - fuse_sec)) -ge 300 ]; then
+                print_warn "熔断超时 300 秒，自动重置"
+                reset_fail_count
+                rm -f "$fuse_time_file"
+            else
+                print_error "【熔断警戒】连续失败已达 ${current_fails} 次，休眠中..."
+                return 1
+            fi
         else
-            print_error "【熔断警戒】连续失败已达 ${current_fails} 次，休眠中..."
-            return 1
+            rm -f "/tmp/qhulogin_fuse_time" 2>/dev/null
         fi
     else
+        # 强制认证：重置熔断计数
+        reset_fail_count
         rm -f "/tmp/qhulogin_fuse_time" 2>/dev/null
     fi
 
@@ -441,42 +464,32 @@ do_login() {
         return 0
     fi
 
-    load_cache
-    login_page_url="${CACHE_LOGIN_URL:-}"
-    
-    if [ -z "$login_page_url" ]; then
-        eportal_host=$(discover_eportal_host)
-        if [ -n "$eportal_host" ]; then
-            gw_resp=$(run_curl -s -L -m 3 "http://${eportal_host}/eportal/index.jsp")
-            login_page_url=$(echo "$gw_resp" | grep -oE "href='[^']+'" | head -1 | sed "s/href='//;s/'//")
-            [ -z "$login_page_url" ] && login_page_url=$(echo "$gw_resp" | grep -oE 'href="[^"]+"' | head -1 | sed 's/href="//;s/"//')
-            [ -z "$login_page_url" ] && login_page_url=$(echo "$gw_resp" | grep -oE "location\.href='[^']+'" | head -1 | sed "s/location\.href='//;s/'//")
-            [ -z "$login_page_url" ] && login_page_url=$(echo "$gw_resp" | grep -oE 'window\.location="[^"]+"' | head -1 | sed 's/window\.location="//;s/"//')
-            [ -z "$login_page_url" ] && login_page_url=$(echo "$gw_resp" | grep -oiE 'url=[^"]+' | head -1 | sed 's/[Uu][Rr][Ll]=//')
-        fi
-    fi
-
-    if [ -z "$login_page_url" ]; then
-        print_error "网关失联，无法获取认证页面"
+    # 每接口独立获取 login_page_url（含当前接口的 wlanuserip）
+    # 不使用缓存，避免跨接口 wlanuserip 污染
+    eportal_ip=$(discover_eportal_ip)
+    if [ -z "$eportal_ip" ]; then
+        print_error "ePortal IP 未发现 (尝试配置 EPORTAL_IP)"
         inc_fail_count
         return 1
     fi
 
-    CACHE_LOGIN_URL="$login_page_url"
+    # 通过根路径 / 获取 302 重定向（含当前接口的 wlanuserip）
+    login_page_url=$(probe_eportal_root "$eportal_ip" "$my_iface")
+    if [ -z "$login_page_url" ]; then
+        print_error "ePortal 根路径无 302 响应 (可能已在线或 ePortal 异常)"
+        inc_fail_count
+        return 1
+    fi
+
     login_url=$(echo "$login_page_url" | awk -F '?' '{print $1}')
     login_url="${login_url/index.jsp/InterFace.do?method=login}"
 
-    query_string="${CACHE_QUERY_STRING:-}"
-    if [ -z "$query_string" ]; then
-        query_string=$(echo "$login_page_url" | awk -F '?' '{print $2}')
-        # 兼容开关：部分老式锐捷需要深度 Encode
-        if [ "${ENCODE_QUERY:-0}" = "1" ]; then
-            query_string="${query_string//&/%2526}"
-            query_string="${query_string//=/%253D}"
-        fi
-        CACHE_QUERY_STRING="$query_string"
+    query_string=$(echo "$login_page_url" | awk -F '?' '{print $2}')
+    # 兼容开关：部分老式锐捷需要深度 Encode
+    if [ "${ENCODE_QUERY:-0}" = "1" ]; then
+        query_string="${query_string//&/%2526}"
+        query_string="${query_string//=/%253D}"
     fi
-    save_cache
 
     login_html=$(run_curl -s -m 5 "$login_page_url")
     rsa_key=$(echo "$login_html" | grep -oiE 'publickey[^a-zA-Z0-9]+[a-zA-Z0-9+/=]{60,}' | grep -oE '[a-zA-Z0-9+/=]{60,}' | head -1)
@@ -518,34 +531,27 @@ do_login() {
         fi
         
         inc_fail_count
-        clear_session_cache 
         print_error "认证驳回: $(echo "$result" | head -c 80)"
         return 1
     fi
 }
 
 do_logout() {
-    local login_page_url=""
-    local eportal_host=""
+    local eportal_ip=""
     local logout_url=""
     local info=""
     local user_index=""
     local req_data=""
 
     load_config 2>/dev/null
-    load_cache
-    
-    login_page_url="${CACHE_LOGIN_URL:-}"
-    if [ -z "$login_page_url" ]; then
-        eportal_host=$(discover_eportal_host)
-        [ -n "$eportal_host" ] && login_page_url="http://${eportal_host}/eportal/index.jsp"
-    fi
-    [ -z "$login_page_url" ] && return 1
 
-    logout_url=$(echo "$login_page_url" | awk -F '?' '{print $1}')
-    logout_url="${logout_url/index.jsp/InterFace.do?method=logout}"
+    eportal_ip=$(discover_eportal_ip)
+    [ -z "$eportal_ip" ] && return 1
 
-    info=$(run_curl -s -m 5 -d "userId=${USERNAME}" "${logout_url/method=logout/method=getOnlineUserInfo}")
+    # 登出直接用 ePortal IP 构造 URL（不需要 wlanuserip）
+    logout_url="http://${eportal_ip}/eportal/InterFace.do?method=logout"
+
+    info=$(run_curl -s -m 5 -d "userId=${USERNAME}" "http://${eportal_ip}/eportal/InterFace.do?method=getOnlineUserInfo")
     user_index=$(echo "$info" | grep -oE '"userIndex"[[:space:]]*:[[:space:]]*"?[^,}]+' | awk -F':' '{print $2}' | tr -d ' "')
 
     req_data="userId=${USERNAME}"
@@ -553,7 +559,6 @@ do_logout() {
 
     if run_curl -s -m 5 -d "$req_data" "$logout_url" | grep -qE '"success"[[:space:]]*:[[:space:]]*true'; then
         print_success "下线指令已确认"
-        clear_session_cache
         return 0
     fi
     print_warn "下发完成 (网关无返回)"
@@ -592,8 +597,7 @@ do_keepalive() {
         if [ "$current_fails" -ge 10 ]; then
             print_error "【全网熔断】超时/报错达 10 次，休眠 300 秒防风控..."
             sleep 300
-            reset_fail_count 
-            clear_session_cache
+            reset_fail_count
             continue
         fi
 
@@ -741,6 +745,8 @@ do_config() {
     case "$i" in 1) SERVICE="campus";; 2) SERVICE="unicom";; 3) SERVICE="telecom";; 4) SERVICE="mobile";; esac
     printf "QueryString强转义 (部分老系统填1) [${ENCODE_QUERY:-0}]: "; read -r i
     ENCODE_QUERY="${i:-${ENCODE_QUERY:-0}}"
+    printf "ePortal服务器IP (绕过FakeIP, 留空自动发现) [${EPORTAL_IP:-}]: "; read -r i
+    EPORTAL_IP="${i:-${EPORTAL_IP:-}}"
     save_config
 }
 
@@ -759,11 +765,11 @@ main() {
         *) 
             while true; do
                 do_status
-                echo -e "  ${CYAN}1${NC} 登入  ${CYAN}2${NC} 登出  ${CYAN}3${NC} 日志  ${CYAN}4${NC} 配置  ${CYAN}5${NC} 启停保活  ${CYAN}u${NC} 更新  ${CYAN}0${NC} 退出"
+                echo -e "  ${CYAN}1${NC} 登入  ${CYAN}2${NC} 强制认证  ${CYAN}3${NC} 登出  ${CYAN}4${NC} 日志  ${CYAN}5${NC} 配置  ${CYAN}6${NC} 启停保活  ${CYAN}u${NC} 更新  ${CYAN}0${NC} 退出"
                 printf "选择: "; read -r c
                 case "$c" in
-                    1) do_login ;; 2) do_logout ;; 3) do_logs ;; 4) do_config ;;
-                    5) 
+                    1) do_login ;; 2) do_login force ;; 3) do_logout ;; 4) do_logs ;; 5) do_config ;;
+                    6) 
                         if is_daemon_running; then
                             [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop 2>/dev/null || {
                                 # 精准终止 keepalive 守护进程，避免误杀当前交互进程
